@@ -1,0 +1,66 @@
+spring:
+  application:
+    name: ticketflow-app
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/ticketflow}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      minimum-idle: 2
+      connection-timeout: 30000
+#      leak-detection-threshold: 5000 # Catch slow @Transactional or unclosed connections
+      leak-detection-threshold: 5000
+
+  jpa:
+    hibernate:
+#      validate ensures schema matches entities without auto-modifying the DB.
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true
+#       never activates on this path: deductStock() flushes a single Inventory row
+        jdbc.batch_size: 20
+#        per transaction; batch requires multiple same type entities in one flush
+        order_inserts: true
+#        Avoid LazyInitializationExceptions; keep transactions tight.
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false  # Instant serializes as ISO-8601, not epoch millis
+
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+server:
+  port: 8080
+  shutdown: graceful
+
+jwt:
+  secret: ${JWT_SECRET:dev-only-secret-do-not-use-in-prod-1234}
+  expiration-ms: 86400000
+
+security:
+  bcrypt:
+    strength: ${BCRYPT_STRENGTH:10}
+
+ticketflow:
+  timeout:
+    fixed-delay: 60000
+    batch-size: 100
+    max-rounds: 50
+
+logging:
+  level:
+    com.chendev.ticketflow: DEBUG
+    org.springframework.security: INFO
