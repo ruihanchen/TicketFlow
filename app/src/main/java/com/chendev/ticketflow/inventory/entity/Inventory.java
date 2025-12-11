@@ -46,8 +46,8 @@ public class Inventory {
         return inv;
     }
 
-    //invariant:InventoryService must validate stock before calling deduct();
-    //reaching this block indicates a caller side bug throw 500
+    //InventoryService checks availableStock before calling deduct();reaching here means a caller bug.
+    //IllegalStateException(not DomainException): this is a programming error, not a business rule violation
     public void deduct(int quantity) {
         if (this.availableStock < quantity) {
             throw new IllegalStateException(

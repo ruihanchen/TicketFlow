@@ -45,6 +45,10 @@ spring:
 server:
   port: 8080
   shutdown: graceful
+  tomcat:
+    threads:
+      max: 400
+    accept-count: 200 # OS TCP backlog
 
 jwt:
   secret: ${JWT_SECRET:dev-only-secret-do-not-use-in-prod-1234}
@@ -55,6 +59,8 @@ security:
     strength: ${BCRYPT_STRENGTH:10}
 
 ticketflow:
+  order:
+    payment-window-minutes: 15
   timeout:
     fixed-delay: 60000
     batch-size: 100
