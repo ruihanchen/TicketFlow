@@ -113,4 +113,6 @@ public class Order {
     public boolean isExpired() {
         return expiredAt != null && Instant.now().isAfter(expiredAt);
     }
+    // test helper:forces expiredAt into the past so that OrderTimeoutService picks it up immediately
+    public void expireNow() { this.expiredAt = Instant.now().minusSeconds(1); }
 }
