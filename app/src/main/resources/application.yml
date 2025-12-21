@@ -11,22 +11,32 @@ spring:
       maximum-pool-size: ${DB_POOL_SIZE:10}
       minimum-idle: 2
       connection-timeout: 30000
-#      leak-detection-threshold: 5000 # Catch slow @Transactional or unclosed connections
+      #Catch slow @Transactional or unclosed connections
       leak-detection-threshold: 5000
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # slow Redis throws RedisCommandTimeoutException; InventoryAdapter catches it and falls back to DB
+      timeout: 500ms
+      # must exceed command timeout (500ms) so in-flight commands complete before shutdown.
+      # well below timeout-per-shutdown-phase (30s) to leave Tomcat budget for HTTP draining
+      lettuce:
+        shutdown-timeout: 600ms
 
   jpa:
     hibernate:
-#      validate ensures schema matches entities without auto-modifying the DB.
+      #fail on startup if entity and schema diverge(never silently alter)
       ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
         format_sql: true
-#       never activates on this path: deductStock() flushes a single Inventory row
+        #batch never activates on the deductStock() path;saveAndFlush() commits one Inventory row per transaction
         jdbc.batch_size: 20
-#        per transaction; batch requires multiple same type entities in one flush
         order_inserts: true
-#        Avoid LazyInitializationExceptions; keep transactions tight.
+    #keeps DB connections out of the view layer;default true holds a session open for the entire HTTP request
     open-in-view: false
 
   flyway:
