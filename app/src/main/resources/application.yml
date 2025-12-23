@@ -76,6 +76,11 @@ ticketflow:
     batch-size: 100
     max-rounds: 50
 
+  reconciliation:
+    # 5 min: drift only occurs on crash between Redis DECRBY and DB commit,
+    # short enough to avoid "phantom sold out" for buyers; cost is negligible (findAll + N Redis GETs)
+    fixed-delay: 300000
+
 logging:
   level:
     com.chendev.ticketflow: DEBUG

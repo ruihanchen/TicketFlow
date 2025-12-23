@@ -57,7 +57,8 @@ public class OrderService {
             throw DomainException.of(ResultCode.INSUFFICIENT_STOCK);
         }
         if (result == DeductionResult.LOCK_CONFLICT) {
-            // @Version conflict — another thread won this round.
+            // @Version conflict path;only reachable via ConcurrentInventoryTest (direct InventoryService call).
+            // InventoryAdapter uses conditional UPDATE and never returns LOCK_CONFLICT.
             throw DomainException.of(ResultCode.INVENTORY_LOCK_FAILED);
         }
 
@@ -73,9 +74,15 @@ public class OrderService {
             orderRepository.save(order);
             orderRepository.flush();
         } catch (DataIntegrityViolationException e) {
-            //concurrent duplicate requestId; hibernate session is rollback-only
+            //concurrent duplicate requestId: session is rollback-only after this,
+            //DB deduction rolls back with the TX; Redis needs explicit compensation.
+            safeReleaseStock(req.getTicketTypeId(), req.getQuantity());
             throw DomainException.of(ResultCode.DUPLICATE_REQUEST,
                     "order already exists for this requestId", e);
+        } catch (Exception e) {
+            //any other DB failure:same compensation logic
+            safeReleaseStock(req.getTicketTypeId(), req.getQuantity());
+            throw e;
         }
 
         log.info("[Order] created: orderNo={}, userId={}, ticketTypeId={}",
@@ -111,7 +118,7 @@ public class OrderService {
         return new OrderResponse(order);
     }
 
-    // System timeout: no ownership check; called by OrderTimeoutService.
+    //system timeout: no ownership check; called by OrderTimeoutService.
     @Transactional
     public void cancelOrderBySystem(String orderNo) {
         Order order = findByOrderNo(orderNo);
@@ -136,13 +143,25 @@ public class OrderService {
         log.info("[Order] cancelled: orderNo={}, reason={}", order.getOrderNo(), reason);
     }
 
-    // ORDER_NOT_FOUND instead of FORBIDDEN; don't let users enumerate others' orders.
+    //DB stock is restored by TX rollback; Redis needs explicit INCRBY.
+    //DB release will fail here (TX is rollback-only),that's expected,
+    //Redis INCRBY already completed (Redis-first ordering in InventoryAdapter).
+    private void safeReleaseStock(Long ticketTypeId, int quantity) {
+        try {
+            inventoryPort.releaseStock(ticketTypeId, quantity);
+        } catch (Exception e) {
+            log.warn("[Order] DB release failed during compensation (expected if TX rolled back), " +
+                    "Redis already compensated: ticketTypeId={}, qty={}", ticketTypeId, quantity);
+        }
+    }
+
+    //ORDER_NOT_FOUND instead of FORBIDDEN:don't let users enumerate others' orders
     private Order findByOrderNoForUser(String orderNo, Long userId) {
         return orderRepository.findByOrderNoAndUserId(orderNo, userId)
                 .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
     }
 
-    // No ownership check: system processes only.
+    //no ownership check: system processes only.
     private Order findByOrderNo(String orderNo) {
         return orderRepository.findByOrderNo(orderNo)
                 .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
