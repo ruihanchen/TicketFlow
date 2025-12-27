@@ -9,7 +9,7 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 // thin wrapper around Redis inventory operations.
-// does NOT catch Redis exceptions; InventoryAdapter handles fallback.
+// does NOT catch Redis exceptions; InventoryAdapter and ReconciliationService handle fallback.
 @Slf4j
 @Component
 public class RedisInventoryManager {
@@ -31,6 +31,7 @@ public class RedisInventoryManager {
         this.deductScript.setResultType(Long.class);
     }
 
+    // returns SUCCESS(1), INSUFFICIENT(0), or CACHE_MISS(-1)
     public int deduct(Long ticketTypeId, int quantity) {
         Long result = redisTemplate.execute(
                 deductScript,
@@ -39,14 +40,20 @@ public class RedisInventoryManager {
         return result != null ? result.intValue() : CACHE_MISS;
     }
 
+    // INCRBY is atomic: safe under concurrency
     public void release(Long ticketTypeId, int quantity) {
-        //INCRBY is atomic(safe under concurrency)
         redisTemplate.opsForValue().increment(keyOf(ticketTypeId), quantity);
     }
 
-    //called from InventoryService.initStock(); DB row and Redis key initialized together
+    // called from initStock() and ReconciliationService;full overwrite, not increment
     public void warmUp(Long ticketTypeId, int stock) {
         redisTemplate.opsForValue().set(keyOf(ticketTypeId), String.valueOf(stock));
+    }
+
+    // returns null if key doesn't exist; ReconciliationService treats null as redis < db
+    public Integer getStock(Long ticketTypeId) {
+        String value = redisTemplate.opsForValue().get(keyOf(ticketTypeId));
+        return value != null ? Integer.parseInt(value) : null;
     }
 
     private String keyOf(Long ticketTypeId) {
