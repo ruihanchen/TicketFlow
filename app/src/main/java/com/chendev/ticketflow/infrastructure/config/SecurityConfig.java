@@ -17,8 +17,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
-
-//bypass Spring Security: AuthService handles auth logic directly
+//no AuthenticationManager,AuthService calls passwordEncoder.matches() directly.
+//DaoAuthenticationProvider is bypassed intentionally; wiring it would duplicate the logic.
 @Configuration
 @EnableMethodSecurity
 @RequiredArgsConstructor
@@ -39,6 +39,9 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/api/v1/auth/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/events", "/api/v1/events/**").permitAll()
+                        // explicit allowlist (not /actuator/**),defense-in-depth layer 2
+                        // against accidental info leak via env/beans/heapdump if exposure.include drifts
+                        .requestMatchers("/actuator/health", "/actuator/prometheus").permitAll()
                         .anyRequest().authenticated())
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
 

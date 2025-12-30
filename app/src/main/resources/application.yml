@@ -11,24 +11,21 @@ spring:
       maximum-pool-size: ${DB_POOL_SIZE:10}
       minimum-idle: 2
       connection-timeout: 30000
-      #Catch slow @Transactional or unclosed connections
+      #logs a warning if a connection is held > 5s
       leak-detection-threshold: 5000
 
   data:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-      # slow Redis throws RedisCommandTimeoutException; InventoryAdapter catches it and falls back to DB
+      #slow Redis throws RedisCommandTimeoutException; InventoryAdapter catches it and falls back to DB
       timeout: 500ms
-      # must exceed command timeout (500ms) so in-flight commands complete before shutdown.
-      # well below timeout-per-shutdown-phase (30s) to leave Tomcat budget for HTTP draining
       lettuce:
-        shutdown-timeout: 600ms
+        shutdown-timeout: 600ms # > command timeout (500ms) so in-flight commands finish; << 30s shutdown budget
 
   jpa:
     hibernate:
-      #fail on startup if entity and schema diverge(never silently alter)
-      ddl-auto: validate
+      ddl-auto: validate #fail on startup if entity and schema diverge(never silently alter)
     show-sql: false
     properties:
       hibernate:
@@ -47,7 +44,7 @@ spring:
   jackson:
     default-property-inclusion: non_null
     serialization:
-      write-dates-as-timestamps: false  # Instant serializes as ISO-8601, not epoch millis
+      write-dates-as-timestamps: false # Instant serializes as ISO-8601, not epoch millis
 
   lifecycle:
     timeout-per-shutdown-phase: 30s
@@ -59,6 +56,26 @@ server:
     threads:
       max: 400
     accept-count: 200 # OS TCP backlog
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      #when-authorized hides component internals from unauthenticated callers
+      show-details: when-authorized
+  prometheus:
+    metrics:
+      export:
+        #explicit: @ConditionalOnEnabledMetricsExport can silently evaluate false without this
+        enabled: true
+  metrics:
+    distribution:
+      #Grafana histogram_quantile() has no buckets to compute p95/p99  without this
+      percentiles-histogram:
+        http.server.requests: true
 
 jwt:
   secret: ${JWT_SECRET:dev-only-secret-do-not-use-in-prod-1234}
@@ -77,7 +94,7 @@ ticketflow:
     max-rounds: 50
 
   reconciliation:
-    # 5 min: drift only occurs on crash between Redis DECRBY and DB commit,
+    # 5 min: drift only occurs on crash between Redis DECRBY and DB commit.
     # short enough to avoid "phantom sold out" for buyers; cost is negligible (findAll + N Redis GETs)
     fixed-delay: 300000
 
