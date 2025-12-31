@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: 'TicketFlow'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false # allows removing provisioned dashboards via UI; fine for local dev
+    updateIntervalSeconds: 30 # poll interval for dashboard file changes; default is 0 (no hot-reload)
+    allowUiUpdates: true # allows saving edits back to the provisioned file; disable in production
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

@@ -56,6 +56,8 @@ server:
     threads:
       max: 400
     accept-count: 200 # OS TCP backlog
+    mbeanregistry:
+      enabled: true # required for TomcatMetrics to locate JMX beans; disabled by default to save memory
 
 management:
   endpoints:
