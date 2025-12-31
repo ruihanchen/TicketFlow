@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus # fixed uid, dashboard JSON references this statically; random uid breaks all panel lookups
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false # provisioned datasources revert on restart if edited via UI
+    jsonData:
+      timeInterval: 15s # matches scrape_interval; Grafana won't request finer resolution than available
+      httpMethod: POST # keeps PromQL out of the URL; avoids 8KB GET limit on range queries

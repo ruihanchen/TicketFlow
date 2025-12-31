@@ -36,10 +36,26 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=7d' # enough for local benchmark comparison; default is 15d
+      - '--storage.tsdb.retention.time=7d' # local dev only; default 15d is overkill
     extra_hosts:
-      - # lets Prometheus reach the Spring Boot app running on the host (not in Docker)
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:host-gateway" # Spring Boot runs on host, not in Docker
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: ticketflow-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ticketflow-grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false # explicit; default changed in some Grafana 11 builds
+    depends_on:
+      - prometheus # datasource provisioning queries Prometheus on startup
 
 volumes:
   ticketflow-postgres-data:
+  ticketflow-grafana-data:
