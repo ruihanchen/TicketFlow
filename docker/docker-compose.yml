@@ -27,5 +27,19 @@ services:
       timeout: 5s
       retries: 5
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ticketflow-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d' # enough for local benchmark comparison; default is 15d
+    extra_hosts:
+      - # lets Prometheus reach the Spring Boot app running on the host (not in Docker)
+      - "host.docker.internal:host-gateway"
+
 volumes:
   ticketflow-postgres-data:
