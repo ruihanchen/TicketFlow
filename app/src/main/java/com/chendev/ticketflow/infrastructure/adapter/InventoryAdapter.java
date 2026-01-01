@@ -1,5 +1,6 @@
 package com.chendev.ticketflow.infrastructure.adapter;
 
+import com.chendev.ticketflow.infrastructure.metrics.InventoryMetrics;
 import com.chendev.ticketflow.inventory.redis.RedisInventoryManager;
 import com.chendev.ticketflow.inventory.service.InventoryService;
 import com.chendev.ticketflow.order.port.InventoryPort;
@@ -37,11 +38,14 @@ public class InventoryAdapter implements InventoryPort {
                 return DeductionResult.INSUFFICIENT;
             }
 
-            // CACHE_MISS: treat the same as Redis DOWN(fall through to DB).
+            // CACHE_MISS: key absent -- fall through to DB, counter tracks Redis health
             log.debug("[Inventory] CACHE_MISS, falling back to DB: ticketTypeId={}", ticketTypeId);
+            InventoryMetrics.recordRedisFallback();
 
         } catch (Exception e) {
+            // Redis unavailable, same fallback path and SLO signal as CACHE_MISS
             log.warn("[Inventory] Redis unavailable, falling back to DB: {}", e.getMessage());
+            InventoryMetrics.recordRedisFallback();
         }
 
         // DB fallback: conditional UPDATE, zero retry
