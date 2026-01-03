@@ -2,6 +2,10 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: ticketflow-postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical" # required for Debezium CDC; default replica does not emit logical decoding
     environment:
       POSTGRES_DB: ticketflow
       POSTGRES_USER: postgres
