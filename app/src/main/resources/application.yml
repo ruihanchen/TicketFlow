@@ -79,6 +79,18 @@ management:
       percentiles-histogram:
         http.server.requests: true
 
+debezium:
+  connector:
+    name: ticketflow-inventory-connector
+    table-include-list: public.inventories
+    slot-name: ticketflow_debezium_slot # explicit name; default 'debezium' is too generic
+    publication-name: ticketflow_debezium_pub
+  offset:
+    storage-file: ${DEBEZIUM_OFFSET_FILE:./data/debezium/offsets.dat}
+    # not /tmp -- /tmp cleanup causes full WAL replay on restart
+    schema-history-file: ${DEBEZIUM_SCHEMA_HISTORY_FILE:./data/debezium/schema-history.dat}
+    flush-interval-ms: ${DEBEZIUM_FLUSH_MS:1000} # 1s vs default 60s: limits duplicate delivery on crash
+
 jwt:
   secret: ${JWT_SECRET:dev-only-secret-do-not-use-in-prod-1234}
   expiration-ms: 86400000

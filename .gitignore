@@ -13,3 +13,6 @@ target/
 
 *.DS_Store
 Thumbs.db
+
+# Debezium runtime state (offsets, schema history) — never commit
+/app/data/debezium/
