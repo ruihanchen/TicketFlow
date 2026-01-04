@@ -22,9 +22,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-//embedded Debezium engine that tails Postgres WAL for public.inventories changes.
-//derives DB connection from Spring's DataSource so both share the same Postgres instance.
-//persists offsets locally so restarts resume from the last committed WAL position.
+// Derives DB connection from HikariDataSource so test profile overrides (spring.datasource.url) apply automatically,
+// no separate Debezium config file needed.
 @Slf4j
 @Configuration
 @RequiredArgsConstructor
@@ -42,6 +41,12 @@ public class DebeziumEngineLifecycle {
     @Value("${debezium.connector.publication-name}")
     private String publicationName;
 
+    @Value("${debezium.connector.tombstones-on-delete}")
+    private String tombstonesOnDelete;
+
+    @Value("${debezium.connector.snapshot-mode}")
+    private String snapshotMode;
+
     @Value("${debezium.offset.storage-file}")
     private String offsetStorageFile;
 
@@ -52,6 +57,7 @@ public class DebeziumEngineLifecycle {
     private String offsetFlushIntervalMs;
 
     private final DataSource dataSource;
+    private final InventoryChangeHandler inventoryChangeHandler;
 
     private ExecutorService executor;
     private DebeziumEngine<ChangeEvent<String, String>> engine;
@@ -65,7 +71,7 @@ public class DebeziumEngineLifecycle {
 
         engine = DebeziumEngine.create(Json.class)
                 .using(props)
-                .notifying(this::handleChangeEvent)
+                .notifying(inventoryChangeHandler)
                 .build();
 
         executor = Executors.newSingleThreadExecutor(r -> {
@@ -127,15 +133,18 @@ public class DebeziumEngineLifecycle {
         props.setProperty("publication.name", publicationName);
         //scope to table.include.list; no superuser needed
         props.setProperty("publication.autocreate.mode", "filtered");
-        //seeds Redis on first start; resumes from saved offset after
-        props.setProperty("snapshot.mode", "initial");
+        // when_needed: re-snapshots if the saved LSN is gone (DB restore, Testcontainers restart).
+        // 'initial' would hang in those cases, it skips snapshot whenever an offset file exists.
+        props.setProperty("snapshot.mode", snapshotMode);
+        // tombstones serve Kafka log compaction only; suppressed here to avoid double handler invocations on delete
+        props.setProperty("tombstones.on.delete", tombstonesOnDelete);
 
         // engine requires schema history even if the consumer doesn't use it
         props.setProperty("schema.history.internal", "io.debezium.storage.file.history.FileSchemaHistory");
         props.setProperty("schema.history.internal.file.filename", schemaHistoryFile);
 
-        log.info("[Debezium] Connection derived from Spring DataSource: host={}, port={}, db={}",
-                conn.host, conn.port, conn.database);
+        log.info("[Debezium] Connection derived from Spring DataSource: host={}, port={}, db={}, snapshot.mode={}",
+                conn.host, conn.port, conn.database, snapshotMode);
 
         return props;
     }
@@ -155,7 +164,7 @@ public class DebeziumEngineLifecycle {
             throw new IllegalStateException(
                     "Unsupported JDBC URL for Debezium: " + jdbcUrl);
         }
-        // Strip the "jdbc:" prefix so java.net.URI recognizes the scheme.
+
         String uriString = jdbcUrl.substring("jdbc:".length());
         try {
             URI uri = new URI(uriString);
@@ -180,11 +189,6 @@ public class DebeziumEngineLifecycle {
         if (parent != null) {
             Files.createDirectories(parent.toPath());
         }
-    }
-    //placeholder: logs every event to verify the pipeline end-to-end
-    //replace with real Redis sync logic in the next commit
-    private void handleChangeEvent(ChangeEvent<String, String> event) {
-        log.info("[Debezium] CDC event received: key={}, value={}", event.key(), event.value());
     }
 
     private record JdbcConnection(String host, int port, String database) {

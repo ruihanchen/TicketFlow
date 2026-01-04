@@ -85,6 +85,10 @@ debezium:
     table-include-list: public.inventories
     slot-name: ticketflow_debezium_slot # explicit name; default 'debezium' is too generic
     publication-name: ticketflow_debezium_pub
+    tombstones-on-delete: false
+    # when_needed re-snapshots if the saved LSN is no longer in WAL (DB restore, failover, volume replacement).
+    # initial skips snapshot whenever an offset file exists, so it silently hangs in those scenarios.
+    snapshot-mode: when_needed
   offset:
     storage-file: ${DEBEZIUM_OFFSET_FILE:./data/debezium/offsets.dat}
     # not /tmp -- /tmp cleanup causes full WAL replay on restart
