@@ -1,17 +1,14 @@
 spring:
   flyway:
     enabled: true
-
   datasource:
     hikari:
       #sized for 200 thread ConcurrentInventoryTest
       maximum-pool-size: 50
-
   jpa:
     show-sql: false
     hibernate:
       ddl-auto: validate
-
 ticketflow:
   timeout:
     #disables the timeout reaper during tests;prevents it from cancelling orders mid-assertion

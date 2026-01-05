@@ -7,8 +7,8 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 
-//base class for integration tests; One container for the whole suite;
-//each class containers reload the Spring context on every test class.
+//base class for integration tests. One container instance shared across the suite;
+//per-class containers would reload the Spring context on every test class.
 @SpringBootTest
 @ActiveProfiles("test")
 public abstract class IntegrationTestBase {
@@ -23,6 +23,8 @@ public abstract class IntegrationTestBase {
                 .withDatabaseName("ticketflow_test")
                 .withUsername("test")
                 .withPassword("test");
+        //wal_level=logical required for Debezium CDC; fsync=off preserves startup speed
+        POSTGRES.setCommand("postgres", "-c", "fsync=off", "-c", "wal_level=logical");
         POSTGRES.start();
 
         REDIS = new GenericContainer<>("redis:7.4.1-alpine")
@@ -37,7 +39,7 @@ public abstract class IntegrationTestBase {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
 
-        //Testcontainers maps 6379 to a random host port(can't hardcode)
+        //Testcontainers assigns a random host port; can't hardcode 6379
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
