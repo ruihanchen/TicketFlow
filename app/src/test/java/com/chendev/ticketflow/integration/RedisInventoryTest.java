@@ -13,17 +13,25 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
-//tests go through the full port/adapter chain to verify production behavior, not internal implementation details.
-public class RedisInventoryTest extends IntegrationTestBase{
+//tests go through the full port/adapter chain to verify production behavior,
+//DB assertions are synchronous; Redis assertions use Awaitility because Redis is now
+//updated asynchronously by the CDC pipeline, not by the adapter directly.
+public class RedisInventoryTest extends IntegrationTestBase {
+
     private static final Long TICKET_TYPE_ID = 888L;
     private static final int INITIAL_STOCK = 100;
+
+    private static final Duration CDC_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
 
     @Autowired private InventoryPort inventoryPort;
     @Autowired private InventoryService inventoryService;
@@ -40,23 +48,23 @@ public class RedisInventoryTest extends IntegrationTestBase{
         inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
     }
 
-
     @Test
-    void redis_deduction_decrements_both_redis_and_db() {
+    void redis_deduction_decrements_db_and_cdc_propagates_to_redis() {
         DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, 3);
-
+        //DB commits synchronously; Redis follows via CDC
         assertThat(result).isEqualTo(DeductionResult.SUCCESS);
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK - 3);
         assertThat(dbStock()).isEqualTo(INITIAL_STOCK - 3);
+        awaitRedisStock(INITIAL_STOCK - 3);
     }
 
     @Test
     void redis_insufficient_does_not_change_stock() {
         DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, INITIAL_STOCK + 1);
 
+        //guardDeduct returns 0 rows affected; no DB change, no WAL event, no Redis change
         assertThat(result).isEqualTo(DeductionResult.INSUFFICIENT);
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
         assertThat(dbStock()).isEqualTo(INITIAL_STOCK);
+        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
     }
 
     @Test
@@ -110,18 +118,17 @@ public class RedisInventoryTest extends IntegrationTestBase{
                 threads, sold.get(), rejected.get(),
                 remaining, redisInventoryManager.getStock(TICKET_TYPE_ID));
 
-        // Zero oversell: sold + remaining = initial stock
+        //zero oversell: guardDeduct holds a row-level lock across check-and-decrement
         assertThat(sold.get() + remaining).isEqualTo(stock);
         assertThat(remaining).isGreaterThanOrEqualTo(0);
 
-        // Lua atomicity guarantee: exactly `stock` threads succeed, no more, no less.
-        // a weaker assertion (sold <= stock) would miss Lua logic bugs that undersell.
+        // guardDeduct guarantee: exactly `stock` threads succeed, no more, no less.
+        // a weaker assertion (sold <= stock) would miss conditional-UPDATE bugs that undersell.
         assertThat(sold.get()).isEqualTo(stock);
 
-        // Redis and DB must agree
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(remaining);
+        // Redis follows DB via CDC; WSL2 typically < 500ms, cloud Postgres faster
+        awaitRedisStock(remaining);
     }
-
 
     @Test
     void reconciliation_fixes_redis_below_db() {
@@ -156,10 +163,18 @@ public class RedisInventoryTest extends IntegrationTestBase{
         assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
     }
 
-
     private int dbStock() {
         return inventoryRepository.findByTicketTypeId(TICKET_TYPE_ID)
                 .map(Inventory::getAvailableStock)
                 .orElseThrow();
+    }
+
+    private void awaitRedisStock(int expected) {
+        await().atMost(CDC_TIMEOUT)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> {
+                    Integer actual = redisInventoryManager.getStock(TICKET_TYPE_ID);
+                    return actual != null && actual == expected;
+                });
     }
 }
