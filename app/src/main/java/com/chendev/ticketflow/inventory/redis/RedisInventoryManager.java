@@ -8,14 +8,12 @@ import org.springframework.stereotype.Component;
 
 import java.util.List;
 
-// thin wrapper around Redis inventory operations.
-// does NOT catch Redis exceptions; InventoryAdapter and ReconciliationService handle fallback.
+// thin wrapper around Redis inventory operations, does NOT catch Redis exceptions; callers handle fallback
 @Slf4j
 @Component
 public class RedisInventoryManager {
 
     private static final String KEY_PREFIX = "inventory:";
-
     // Lua return code
     public static final int SUCCESS = 1;
     public static final int INSUFFICIENT = 0;
@@ -45,12 +43,12 @@ public class RedisInventoryManager {
         redisTemplate.opsForValue().increment(keyOf(ticketTypeId), quantity);
     }
 
-    // called from initStock() and ReconciliationService;full overwrite, not increment
+    // called from initStock() to pre-populate the cache alongside the DB insert;
     public void warmUp(Long ticketTypeId, int stock) {
         redisTemplate.opsForValue().set(keyOf(ticketTypeId), String.valueOf(stock));
     }
 
-    // returns null if key doesn't exist; ReconciliationService treats null as redis < db
+    // returns null if key doesn't exist
     public Integer getStock(Long ticketTypeId) {
         String value = redisTemplate.opsForValue().get(keyOf(ticketTypeId));
         return value != null ? Integer.parseInt(value) : null;

@@ -4,7 +4,6 @@ import com.chendev.ticketflow.IntegrationTestBase;
 import com.chendev.ticketflow.inventory.entity.Inventory;
 import com.chendev.ticketflow.inventory.redis.RedisInventoryManager;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
-import com.chendev.ticketflow.inventory.service.InventoryReconciliationService;
 import com.chendev.ticketflow.inventory.service.InventoryService;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import com.chendev.ticketflow.order.port.InventoryPort.DeductionResult;
@@ -22,9 +21,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-//tests go through the full port/adapter chain to verify production behavior,
-//DB assertions are synchronous; Redis assertions use Awaitility because Redis is now
-//updated asynchronously by the CDC pipeline, not by the adapter directly.
+//tests go through the full port/adapter chain to verify production behavior, DB assertions are synchronous;
+//Redis assertions use Awaitility that Redis is updated asynchronously by the CDC pipeline,not by the adapter directly.
 public class RedisInventoryTest extends IntegrationTestBase {
 
     private static final Long TICKET_TYPE_ID = 888L;
@@ -37,7 +35,6 @@ public class RedisInventoryTest extends IntegrationTestBase {
     @Autowired private InventoryService inventoryService;
     @Autowired private InventoryRepository inventoryRepository;
     @Autowired private RedisInventoryManager redisInventoryManager;
-    @Autowired private InventoryReconciliationService reconciliationService;
     @Autowired private StringRedisTemplate redisTemplate;
 
     @BeforeEach
@@ -51,9 +48,11 @@ public class RedisInventoryTest extends IntegrationTestBase {
     @Test
     void redis_deduction_decrements_db_and_cdc_propagates_to_redis() {
         DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, 3);
-        //DB commits synchronously; Redis follows via CDC
+
         assertThat(result).isEqualTo(DeductionResult.SUCCESS);
+        //DB is the source of truth; adapter returns only after guardDeduct commits
         assertThat(dbStock()).isEqualTo(INITIAL_STOCK - 3);
+        //Redis catches up asynchronously via the Debezium pipeline
         awaitRedisStock(INITIAL_STOCK - 3);
     }
 
@@ -118,49 +117,18 @@ public class RedisInventoryTest extends IntegrationTestBase {
                 threads, sold.get(), rejected.get(),
                 remaining, redisInventoryManager.getStock(TICKET_TYPE_ID));
 
-        //zero oversell: guardDeduct holds a row-level lock across check-and-decrement
+        //Zero oversell: guardDeduct's row-level lock serializes concurrent decrements
+        //and the WHERE available_stock >= :quantity guard makes oversell mathematically impossible.
         assertThat(sold.get() + remaining).isEqualTo(stock);
         assertThat(remaining).isGreaterThanOrEqualTo(0);
 
-        // guardDeduct guarantee: exactly `stock` threads succeed, no more, no less.
-        // a weaker assertion (sold <= stock) would miss conditional-UPDATE bugs that undersell.
+        //guardDeduct must neither oversell nor undersell: exactly `stock` threads succeed.
+        //a weaker assertion (sold <= stock) would miss conditional-UPDATE bugs that undersell.
         assertThat(sold.get()).isEqualTo(stock);
 
-        // Redis follows DB via CDC; WSL2 typically < 500ms, cloud Postgres faster
+        //Redis eventually reflects DB state via the CDC pipeline. Under burst load on WSL2
+        //this typically lands within a few hundred milliseconds; cloud Postgres is faster.
         awaitRedisStock(remaining);
-    }
-
-    @Test
-    void reconciliation_fixes_redis_below_db() {
-        // Simulate: Redis deducted but order INSERT failed (crash/rollback).
-        // Redis says 90, DB says 100.
-        redisInventoryManager.warmUp(TICKET_TYPE_ID, 90);
-
-        reconciliationService.reconcile();
-
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
-    }
-
-    @Test
-    void reconciliation_does_not_auto_fix_redis_above_db() {
-        // Simulate: Redis says 110, DB says 100. Should NOT happen normally.
-        redisInventoryManager.warmUp(TICKET_TYPE_ID, 110);
-
-        reconciliationService.reconcile();
-
-        // Redis must NOT be reduced, alert only, no auto-fix; reducing Redis could hide real inventory from buyers.
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(110);
-    }
-
-    @Test
-    void reconciliation_restores_missing_redis_key() {
-        // Simulate: Redis restarted, key lost
-        redisTemplate.delete("inventory:" + TICKET_TYPE_ID);
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isNull();
-
-        reconciliationService.reconcile();
-
-        assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
     }
 
     private int dbStock() {

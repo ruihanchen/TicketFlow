@@ -23,20 +23,20 @@ public class InventoryService {
     public void initStock(Long ticketTypeId, int totalStock) {
         inventoryRepository.save(Inventory.init(ticketTypeId, totalStock));
 
-        //warm up Redis alongside DB so both are in sync from the start; if Redis is down
-        //during event creation, reconciliation restores the key within minutes.
+        // pre-populate Redis so the first read doesn't wait for CDC to catch up.
+        // if Redis is down, Debezium sets the key on the next WAL event, correctness holds either way.
         try {
             redisInventoryManager.warmUp(ticketTypeId, totalStock);
         } catch (Exception e) {
-            log.warn("[Inventory] Redis warm-up failed, reconciliation will fix: ticketTypeId={}",
+            log.warn("[Inventory] Redis warm-up failed, CDC will populate on next update: ticketTypeId={}",
                     ticketTypeId);
         }
 
         log.info("[Inventory] initialized: ticketTypeId={}, stock={}", ticketTypeId, totalStock);
     }
 
-    //@Version optimistic locking, no retry.Kept for ConcurrentInventoryTest; generates the lock contention
-    //that benchmarks; the conditional UPDATE improvement. Not on the production path.
+    //@Version optimistic locking, no retry. Kept for ConcurrentInventoryTest to benchmark
+    //lock contention vs guardDeduct. Not on the production path.
     @Transactional
     public DeductionResult deductStock(Long ticketTypeId, int quantity) {
         Inventory inv = inventoryRepository.findByTicketTypeId(ticketTypeId)
@@ -54,7 +54,7 @@ public class InventoryService {
         return DeductionResult.SUCCESS;
     }
 
-    //conditional UPDATE, zero retry; called by InventoryAdapter for both Redis-confirmed sync & Redis-down fallback.
+    //conditional UPDATE, zero retry. Production deduction path
     @Transactional
     public DeductionResult dbDeduct(Long ticketTypeId, int quantity) {
         int affected = inventoryRepository.guardDeduct(ticketTypeId, quantity);
@@ -65,8 +65,7 @@ public class InventoryService {
         return DeductionResult.SUCCESS;
     }
 
-    //Uses guardRelease (conditional UPDATE) instead of entity-based @Version. During a flash sale,
-    //guardDeduct & releaseStock race on same row;entity-based release hits @Version conflicts ~10-50% of the time
+    //guardRelease (conditional UPDATE) avoids @Version conflicts with concurrent guardDeduct on the same row
     @Transactional
     public void releaseStock(Long ticketTypeId, int quantity) {
         int affected = inventoryRepository.guardRelease(ticketTypeId, quantity);

@@ -13,6 +13,3 @@ ticketflow:
   timeout:
     #disables the timeout reaper during tests;prevents it from cancelling orders mid-assertion
     fixed-delay: 3600000
-  reconciliation:
-    #disables reconciliation during tests;prevents it from overwriting Redis state mid-assertion
-    fixed-delay: 3600000
