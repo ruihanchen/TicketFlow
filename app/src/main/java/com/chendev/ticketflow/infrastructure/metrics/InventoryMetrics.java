@@ -6,8 +6,8 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-//central registry for custom inventory counters. Static accessors let JPA entities
-//(Hibernate-managed, not Spring-managed) record metrics without injection.
+// Inventory correctness counters. Static accessors allow JPA entities to record metrics without Spring injection,
+// hibernate instantiates entities, not Spring
 @Component
 @RequiredArgsConstructor
 public class InventoryMetrics {
@@ -15,17 +15,11 @@ public class InventoryMetrics {
     private final MeterRegistry registry;
 
     private static Counter oversellCounter;
-    private static Counter redisFallbackCounter;
 
     @PostConstruct
     void init() {
         oversellCounter = Counter.builder("ticketflow_inventory_oversell_total")
                 .description("deduct() called with insufficient stock; must always be 0 in healthy operation")
-                .register(registry);
-
-        redisFallbackCounter = Counter.builder("ticketflow_redis_fallback_total")
-                .description("InventoryAdapter fell back from Redis to DB; " +
-                        "sustained rate > 1/s indicates Redis degradation")
                 .register(registry);
     }
 
@@ -33,12 +27,6 @@ public class InventoryMetrics {
         // null guard: Hibernate may instantiate Inventory before @PostConstruct runs
         if (oversellCounter != null) {
             oversellCounter.increment();
-        }
-    }
-
-    public static void recordRedisFallback() {
-        if (redisFallbackCounter != null) {
-            redisFallbackCounter.increment();
         }
     }
 }

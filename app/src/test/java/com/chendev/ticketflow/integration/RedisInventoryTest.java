@@ -21,46 +21,52 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-//tests go through the full port/adapter chain to verify production behavior, DB assertions are synchronous;
-//Redis assertions use Awaitility that Redis is updated asynchronously by the CDC pipeline,not by the adapter directly.
+// Tests go through the full port/adapter chain to verify production behavior.
+// setUp waits for CDC to propagate the INSERT so each test starts from a consistent
+// DB+Redis baseline. DB assertions are synchronous; Redis assertions use Awaitility.
 public class RedisInventoryTest extends IntegrationTestBase {
 
-    private static final Long TICKET_TYPE_ID = 888L;
-    private static final int INITIAL_STOCK = 100;
+    private static final Long     TICKET_TYPE_ID     = 888L;
+    private static final int      INITIAL_STOCK      = 100;
+    private static final int      DEDUCT_QTY         = 3;    // any valid quantity < INITIAL_STOCK
+    private static final int      CONCURRENT_THREADS = 200;
+    private static final int      CONCURRENT_STOCK   = 50;   // < CONCURRENT_THREADS to force contention
 
-    private static final Duration CDC_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration CDC_TIMEOUT   = Duration.ofSeconds(10);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
 
-    @Autowired private InventoryPort inventoryPort;
-    @Autowired private InventoryService inventoryService;
-    @Autowired private InventoryRepository inventoryRepository;
+    @Autowired private InventoryPort         inventoryPort;
+    @Autowired private InventoryService      inventoryService;
+    @Autowired private InventoryRepository   inventoryRepository;
     @Autowired private RedisInventoryManager redisInventoryManager;
-    @Autowired private StringRedisTemplate redisTemplate;
+    @Autowired private StringRedisTemplate   redisTemplate;
 
     @BeforeEach
     void setUp() {
         inventoryRepository.deleteAll();
-        //flush Redis between tests: stale keys from previous runs cause false positives
+        // flush Redis between tests: stale keys from previous runs cause false positives
         redisTemplate.getConnectionFactory().getConnection().serverCommands().flushAll();
         inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
+        // wait for CDC to propagate the INSERT; tests assert against a consistent DB+Redis state
+        awaitRedisStock(INITIAL_STOCK);
     }
 
     @Test
     void redis_deduction_decrements_db_and_cdc_propagates_to_redis() {
-        DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, 3);
+        DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, DEDUCT_QTY);
 
         assertThat(result).isEqualTo(DeductionResult.SUCCESS);
-        //DB is the source of truth; adapter returns only after guardDeduct commits
-        assertThat(dbStock()).isEqualTo(INITIAL_STOCK - 3);
-        //Redis catches up asynchronously via the Debezium pipeline
-        awaitRedisStock(INITIAL_STOCK - 3);
+        // DB is the source of truth; adapter returns only after guardDeduct commits
+        assertThat(dbStock()).isEqualTo(INITIAL_STOCK - DEDUCT_QTY);
+        // Redis catches up asynchronously via the Debezium pipeline
+        awaitRedisStock(INITIAL_STOCK - DEDUCT_QTY);
     }
 
     @Test
     void redis_insufficient_does_not_change_stock() {
         DeductionResult result = inventoryPort.deductStock(TICKET_TYPE_ID, INITIAL_STOCK + 1);
 
-        //guardDeduct returns 0 rows affected; no DB change, no WAL event, no Redis change
+        // no WAL event fires when guardDeduct returns 0 rows -- Redis stays unchanged, sync assertion is safe
         assertThat(result).isEqualTo(DeductionResult.INSUFFICIENT);
         assertThat(dbStock()).isEqualTo(INITIAL_STOCK);
         assertThat(redisInventoryManager.getStock(TICKET_TYPE_ID)).isEqualTo(INITIAL_STOCK);
@@ -68,24 +74,22 @@ public class RedisInventoryTest extends IntegrationTestBase {
 
     @Test
     void concurrent_redis_deduction_zero_oversell() throws InterruptedException {
-        int threads = 200;
-        int stock = 50;
-
-        //reinitialize with smaller stock to force contention
+        // reinitialize with smaller stock to force contention; wait for CDC before launching threads
         inventoryRepository.deleteAll();
         redisTemplate.getConnectionFactory().getConnection().serverCommands().flushAll();
-        inventoryService.initStock(TICKET_TYPE_ID, stock);
+        inventoryService.initStock(TICKET_TYPE_ID, CONCURRENT_STOCK);
+        awaitRedisStock(CONCURRENT_STOCK);
 
-        AtomicInteger sold = new AtomicInteger(0);
+        AtomicInteger sold     = new AtomicInteger(0);
         AtomicInteger rejected = new AtomicInteger(0);
 
-        CountDownLatch ready = new CountDownLatch(threads);
-        CountDownLatch start = new CountDownLatch(1);
-        CountDownLatch finish = new CountDownLatch(threads);
+        CountDownLatch ready  = new CountDownLatch(CONCURRENT_THREADS);
+        CountDownLatch start  = new CountDownLatch(1);
+        CountDownLatch finish = new CountDownLatch(CONCURRENT_THREADS);
 
-        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        ExecutorService pool = Executors.newFixedThreadPool(CONCURRENT_THREADS);
 
-        for (int i = 0; i < threads; i++) {
+        for (int i = 0; i < CONCURRENT_THREADS; i++) {
             pool.submit(() -> {
                 ready.countDown();
                 try {
@@ -111,23 +115,15 @@ public class RedisInventoryTest extends IntegrationTestBase {
 
         int remaining = dbStock();
 
-        System.out.printf(
-                "%n[RedisInventoryTest] threads=%d, sold=%d, rejected=%d, " +
-                        "dbRemaining=%d, redisRemaining=%s%n",
-                threads, sold.get(), rejected.get(),
-                remaining, redisInventoryManager.getStock(TICKET_TYPE_ID));
-
-        //Zero oversell: guardDeduct's row-level lock serializes concurrent decrements
-        //and the WHERE available_stock >= :quantity guard makes oversell mathematically impossible.
-        assertThat(sold.get() + remaining).isEqualTo(stock);
+        // zero oversell: guardDeduct holds a row-level lock across check-and-decrement
+        assertThat(sold.get() + remaining).isEqualTo(CONCURRENT_STOCK);
         assertThat(remaining).isGreaterThanOrEqualTo(0);
 
-        //guardDeduct must neither oversell nor undersell: exactly `stock` threads succeed.
-        //a weaker assertion (sold <= stock) would miss conditional-UPDATE bugs that undersell.
-        assertThat(sold.get()).isEqualTo(stock);
+        // guardDeduct must neither oversell nor undersell: exactly CONCURRENT_STOCK threads succeed.
+        // a weaker assertion (sold <= stock) would miss conditional-UPDATE bugs that undersell.
+        assertThat(sold.get()).isEqualTo(CONCURRENT_STOCK);
 
-        //Redis eventually reflects DB state via the CDC pipeline. Under burst load on WSL2
-        //this typically lands within a few hundred milliseconds; cloud Postgres is faster.
+        // Redis follows DB via CDC; WSL2 typically < 500ms
         awaitRedisStock(remaining);
     }
 
