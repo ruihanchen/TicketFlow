@@ -18,7 +18,9 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-      timeout: 500ms # read path only; a timeout here never affects order correctness
+      #bounds slow Redis reads on the read path; Redis is no longer on the write path
+      #so a timeout here only affects cache GETs, never order correctness
+      timeout: 500ms
       lettuce:
         shutdown-timeout: 600ms # > command timeout (500ms) so in-flight commands finish; << 30s shutdown budget
 
@@ -29,10 +31,11 @@ spring:
     properties:
       hibernate:
         format_sql: true
-        # deductStock() flushes one row per transaction, batch never accumulates
+        #batch never activates on the deductStock() path;saveAndFlush() commits one Inventory row per transaction
         jdbc.batch_size: 20
         order_inserts: true
-    open-in-view: false # default true holds a session open for the entire HTTP request
+    #keeps DB connections out of the view layer;default true holds a session open for the entire HTTP request
+    open-in-view: false
 
   flyway:
     enabled: true
@@ -64,7 +67,8 @@ management:
         include: health,prometheus
   endpoint:
     health:
-      show-details: when-authorized # unauthenticated callers see only {"status":"UP"}
+      #when-authorized hides component internals from unauthenticated callers
+      show-details: when-authorized
   prometheus:
     metrics:
       export:
@@ -72,7 +76,8 @@ management:
         enabled: true
   metrics:
     distribution:
-      #Grafana histogram_quantile() has no buckets to compute p95/p99  without this
+      # enables bucket samples for histogram_quantile() on Spring Boot's auto-registered HTTP timer.
+      # ticketflow_cdc_lag_seconds is configured via the Timer builder directly, not here.
       percentiles-histogram:
         http.server.requests: true
 
