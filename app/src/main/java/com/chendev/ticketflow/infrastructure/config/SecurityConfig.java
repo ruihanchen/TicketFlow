@@ -34,11 +34,16 @@ public class SecurityConfig {
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
                 .csrf(AbstractHttpConfigurer::disable)
-                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                .exceptionHandling(e -> e.authenticationEntryPoint(authEntryPoint))
+                .sessionManagement(
+                        s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .exceptionHandling(
+                        e -> e.authenticationEntryPoint(authEntryPoint))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/api/v1/auth/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/events", "/api/v1/events/**").permitAll()
+                        // public read: same trust level as GET /api/v1/events/**; GET-only,
+                        // no write methods on this path
+                        .requestMatchers(HttpMethod.GET, "/api/v1/ticket-types/*/stock").permitAll()
                         // explicit allowlist (not /actuator/**),defense-in-depth layer 2
                         // against accidental info leak via env/beans/heapdump if exposure.include drifts
                         .requestMatchers("/actuator/health", "/actuator/prometheus").permitAll()
