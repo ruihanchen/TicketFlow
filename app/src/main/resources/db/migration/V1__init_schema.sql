@@ -52,7 +52,7 @@ CREATE TABLE inventories
     --and as the sold-count basis (total_stock - available_stock = sold).
     available_stock INT           NOT NULL,
 
-    --@Version target for optimistic locking; Redis Lua bypasses this column when available
+    --@Version target for optimistic locking; kept for ConcurrentInventoryTest to benchmark against conditional UPDATE.
     version         INT           NOT NULL DEFAULT 0,
     updated_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
 

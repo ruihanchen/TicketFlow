@@ -27,7 +27,6 @@ public class Inventory {
     private Integer availableStock;
 
     //if another thread changed the version,affected rows = 0  → OptimisticLockingFailureException.
-    //Redis Lua bypasses this entirely.
     @Version
     private Integer version;
 
