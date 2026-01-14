@@ -21,6 +21,8 @@ public enum ResultCode {
     ORDER_NOT_FOUND(1001, "order not found", 404),
     INVALID_STATE_TRANSITION(1003, "invalid state transition", 409),
     DUPLICATE_REQUEST(1004, "duplicate request", 409),
+    // 409 not 410: the order still exists, its state just conflicts with the requested action
+    ORDER_EXPIRED(1005, "payment window expired", 409),
 
     // inventory
     INSUFFICIENT_STOCK(2001, "insufficient stock", 409),

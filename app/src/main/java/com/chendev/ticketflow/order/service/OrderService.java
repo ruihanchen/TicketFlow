@@ -88,6 +88,8 @@ public class OrderService {
     @Transactional
     public OrderResponse payOrder(Long userId, String orderNo) {
         Order order = findByOrderNoForUser(orderNo, userId);
+        // checked after ownership lookup, unauthorized callers can't probe order state via expiry errors
+        rejectIfExpired(order);
         order.transitionTo(OrderStatus.PAYING, OrderEvent.INITIATE_PAYMENT,
                 "payment initiated");
         orderRepository.save(order);
@@ -98,6 +100,9 @@ public class OrderService {
     @Transactional
     public OrderResponse confirmPayment(Long userId, String orderNo) {
         Order order = findByOrderNoForUser(orderNo, userId);
+        // defense in depth: payOrder() may have slipped through just before expiry; confirming after expiry
+        // would leave the user with a PAID order the reaper already released
+        rejectIfExpired(order);
         order.transitionTo(OrderStatus.PAID, OrderEvent.PAYMENT_SUCCESS,
                 "payment confirmed");
         orderRepository.save(order);
@@ -147,5 +152,12 @@ public class OrderService {
     private Order findByOrderNo(String orderNo) {
         return orderRepository.findByOrderNo(orderNo)
                 .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
+    }
+
+    // extracted so payOrder() and confirmPayment() share identical expiry semantics
+    private void rejectIfExpired(Order order) {
+        if (order.isExpired()) {
+            throw DomainException.of(ResultCode.ORDER_EXPIRED);
+        }
     }
 }
