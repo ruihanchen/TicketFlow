@@ -2,10 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: ticketflow-postgres
-    command:
-      - "postgres"
-      - "-c"
-      - "wal_level=logical" # required for Debezium CDC; default replica does not emit logical decoding
+    # Debezium requires wal_level=logical(pgoutput plugin). Default is replica which causes Debezium to fail
+    # at startup with "logical decoding requires wal_level >= logical".
+    command: ["postgres", "-c", "wal_level=logical"]
     environment:
       POSTGRES_DB: ticketflow
       POSTGRES_USER: postgres
