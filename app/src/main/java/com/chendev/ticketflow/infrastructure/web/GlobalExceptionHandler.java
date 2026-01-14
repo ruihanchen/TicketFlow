@@ -18,6 +18,7 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 
 import java.util.stream.Collectors;
@@ -82,6 +83,19 @@ public class GlobalExceptionHandler {
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public Result<?> handleMissingParam(MissingServletRequestParameterException e) {
         return Result.fail(ResultCode.BAD_REQUEST, e.getMessage());
+    }
+
+    // non-numeric path variables fall through to handleUnexpected() and return 500 without this,
+    // correct mapping is 400, input never reached domain logic.
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<?> handleTypeMismatch(MethodArgumentTypeMismatchException e) {
+        String requiredType = e.getRequiredType() != null
+                ? e.getRequiredType().getSimpleName() : "expected type";
+        String detail = String.format("invalid value for parameter '%s': expected %s",
+                e.getName(), requiredType);
+        log.warn("[BadRequest] type mismatch: {}", detail);
+        return Result.fail(ResultCode.BAD_REQUEST, detail);
     }
 
     @ExceptionHandler(Exception.class)
