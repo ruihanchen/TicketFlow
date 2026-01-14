@@ -72,6 +72,11 @@ public class Order {
     @Column(nullable = false)
     private Instant expiredAt;
 
+    // Long (not int) per JPA convention, avoids overflow on long-lived entities
+    @Version
+    @Column(nullable = false)
+    private Long version;
+
     @CreatedDate
     @Column(nullable = false, updatable = false, name = "created_at")
     private Instant createdAt;
@@ -105,7 +110,7 @@ public class Order {
             throw DomainException.of(ResultCode.INVALID_STATE_TRANSITION,
                     String.format("cannot go from %s to %s", this.status, newStatus));
         }
-        //must record before updating status -- record() reads this.status as fromStatus
+        //must record before updating status, record() reads this.status as fromStatus
         statusHistory.add(OrderStatusHistory.record(this, this.status, newStatus, event, reason));
         this.status = newStatus;
     }
@@ -113,6 +118,6 @@ public class Order {
     public boolean isExpired() {
         return expiredAt != null && Instant.now().isAfter(expiredAt);
     }
-    // test helper:forces expiredAt into the past so that OrderTimeoutService picks it up immediately
+    //test helper: forces expiredAt into the past so the reaper picks it up immediately
     public void expireNow() { this.expiredAt = Instant.now().minusSeconds(1); }
 }

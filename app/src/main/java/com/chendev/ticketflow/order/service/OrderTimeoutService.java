@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -33,6 +34,7 @@ public class OrderTimeoutService {
     @Scheduled(fixedDelayString = "${ticketflow.timeout.fixed-delay:60000}")
     public void cancelExpiredOrders() {
         int totalCancelled = 0;
+        int skippedDueToRace = 0;
         int round = 0;
         List<Order> batch;
 
@@ -47,6 +49,12 @@ public class OrderTimeoutService {
                 try {
                     orderService.cancelOrderBySystem(order.getOrderNo());
                     totalCancelled++;
+                } catch (ObjectOptimisticLockingFailureException e) {
+                    //User won the race, they transitioned this order before our save landed. Back off and let it ride
+                    //it'll come back around if it's still expired(INFO not ERROR)this is the lock working as designed.
+                    skippedDueToRace++;
+                    log.info("[Timeout] orderNo={} modified concurrently, skipping (will re-check next cycle)",
+                            order.getOrderNo());
                 } catch (Exception e) {
                     // per-order isolation:one failure doesn't block the batch
                     log.error("[Timeout] failed to cancel orderNo={}, error={}",
@@ -62,9 +70,9 @@ public class OrderTimeoutService {
                     "will be processed next cycle", maxRounds);
         }
 
-        if (totalCancelled > 0) {
-            log.info("[Timeout] cancelled {} expired orders in {} rounds",
-                    totalCancelled, round);
+        if (totalCancelled > 0 || skippedDueToRace > 0) {
+            log.info("[Timeout] cancelled {} expired orders in {} rounds (skipped {} due to concurrent user actions)",
+                    totalCancelled, round, skippedDueToRace);
         }
     }
 }
