@@ -60,9 +60,9 @@ class InventoryQueryServiceFallthroughTest {
 
         StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
-        assertThat(result.getTicketTypeId()).isEqualTo(TICKET_TYPE_ID);
-        assertThat(result.getAvailableStock()).isEqualTo(STOCK);
-        assertThat(result.getSource())
+        assertThat(result.ticketTypeId()).isEqualTo(TICKET_TYPE_ID);
+        assertThat(result.availableStock()).isEqualTo(STOCK);
+        assertThat(result.source())
                 .as("Redis exception must surface as a DATABASE-sourced response, not a 5xx")
                 .isEqualTo(StockView.StockSource.DATABASE);
 
@@ -81,8 +81,8 @@ class InventoryQueryServiceFallthroughTest {
 
         StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
-        assertThat(result.getAvailableStock()).isEqualTo(STOCK);
-        assertThat(result.getSource()).isEqualTo(StockView.StockSource.DATABASE);
+        assertThat(result.availableStock()).isEqualTo(STOCK);
+        assertThat(result.source()).isEqualTo(StockView.StockSource.DATABASE);
         verify(inventoryMetrics, times(1)).recordCacheFallthrough();
     }
 
@@ -96,7 +96,7 @@ class InventoryQueryServiceFallthroughTest {
 
         StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
-        assertThat(result.getSource()).isEqualTo(StockView.StockSource.DATABASE);
+        assertThat(result.source()).isEqualTo(StockView.StockSource.DATABASE);
         verify(inventoryMetrics, times(1)).recordCacheFallthrough();
     }
 

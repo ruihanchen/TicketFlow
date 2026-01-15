@@ -57,9 +57,9 @@ class InventoryQueryServiceTest extends IntegrationTestBase {
 
         StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
-        assertThat(result.getTicketTypeId()).isEqualTo(TICKET_TYPE_ID);
-        assertThat(result.getAvailableStock()).isEqualTo(INITIAL_STOCK);
-        assertThat(result.getSource()).isEqualTo(StockView.StockSource.CACHE);
+        assertThat(result.ticketTypeId()).isEqualTo(TICKET_TYPE_ID);
+        assertThat(result.availableStock()).isEqualTo(INITIAL_STOCK);
+        assertThat(result.source()).isEqualTo(StockView.StockSource.CACHE);
 
         // >= because MeterRegistry is shared across the suite and other tests may
         // also drive cache hits before this one runs
@@ -79,8 +79,8 @@ class InventoryQueryServiceTest extends IntegrationTestBase {
 
         StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
-        assertThat(result.getAvailableStock()).isEqualTo(INITIAL_STOCK);
-        assertThat(result.getSource()).isEqualTo(StockView.StockSource.DATABASE);
+        assertThat(result.availableStock()).isEqualTo(INITIAL_STOCK);
+        assertThat(result.source()).isEqualTo(StockView.StockSource.DATABASE);
 
         assertThat(counterValue("ticketflow_inventory_query_cache_misses_total"))
                 .as("cache miss counter must increment when Redis returned null")
@@ -102,16 +102,16 @@ class InventoryQueryServiceTest extends IntegrationTestBase {
         awaitRedisStock(INITIAL_STOCK);
 
         StockView before = inventoryQueryService.getStock(TICKET_TYPE_ID);
-        assertThat(before.getAvailableStock()).isEqualTo(INITIAL_STOCK);
-        assertThat(before.getSource()).isEqualTo(StockView.StockSource.CACHE);
+        assertThat(before.availableStock()).isEqualTo(INITIAL_STOCK);
+        assertThat(before.source()).isEqualTo(StockView.StockSource.CACHE);
 
         // Drive a write through the production write path; CDC should mirror it to Redis
         inventoryService.dbDeduct(TICKET_TYPE_ID, 30);
         awaitRedisStock(INITIAL_STOCK - 30);
 
         StockView after = inventoryQueryService.getStock(TICKET_TYPE_ID);
-        assertThat(after.getAvailableStock()).isEqualTo(INITIAL_STOCK - 30);
-        assertThat(after.getSource())
+        assertThat(after.availableStock()).isEqualTo(INITIAL_STOCK - 30);
+        assertThat(after.source())
                 .as("after CDC propagation, the read should still be served from cache")
                 .isEqualTo(StockView.StockSource.CACHE);
     }
