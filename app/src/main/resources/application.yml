@@ -110,8 +110,7 @@ ticketflow:
     payment-window-minutes: 15
   timeout:
     fixed-delay: 60000
-    batch-size: 100
-    max-rounds: 50
+    max-per-cycle: 5000 # caps runaway loops if backlog spikes; remainder deferred to next tick
 
 logging:
   level:

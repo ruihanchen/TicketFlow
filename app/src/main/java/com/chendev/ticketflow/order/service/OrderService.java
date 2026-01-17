@@ -17,11 +17,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 @Slf4j
@@ -117,11 +120,26 @@ public class OrderService {
         return new OrderResponse(order);
     }
 
-    //system timeout: no ownership check; called by OrderTimeoutService.
+    // returns true if an order was processed, false when the backlog is empty
     @Transactional
-    public void cancelOrderBySystem(String orderNo) {
-        Order order = findByOrderNo(orderNo);
-        executeCancel(order, OrderEvent.SYSTEM_TIMEOUT, "payment window expired");
+    public boolean processOneExpiredOrder() {
+        // SKIP LOCKED: two reaper instances each get a disjoint set of rows, no external lock needed
+        List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
+                Instant.now(), PageRequest.of(0, 1));
+
+        if (locked.isEmpty()) {
+            return false;
+        }
+
+        Order order = locked.get(0);
+        // PAYING orders never reach here, WHERE clause is hardcoded to CREATED only
+        order.transitionTo(OrderStatus.CANCELLED, OrderEvent.SYSTEM_TIMEOUT,
+                "payment window expired");
+        // transitionTo() validates state machine and writes statusHistory even though status is guaranteed CREATED
+        inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
+        // order is managed; no explicit save needed(@Version increments at flush)
+        log.info("[Order] cancelled by system: orderNo={}", order.getOrderNo());
+        return true;
     }
 
     @Transactional(readOnly = true)
@@ -145,12 +163,6 @@ public class OrderService {
     //ORDER_NOT_FOUND instead of FORBIDDEN:don't let users enumerate others' orders
     private Order findByOrderNoForUser(String orderNo, Long userId) {
         return orderRepository.findByOrderNoAndUserId(orderNo, userId)
-                .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
-    }
-
-    //no ownership check: system processes only.
-    private Order findByOrderNo(String orderNo) {
-        return orderRepository.findByOrderNo(orderNo)
                 .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
     }
 

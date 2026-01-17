@@ -16,20 +16,25 @@ import com.chendev.ticketflow.order.statemachine.OrderStatus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-// 2 @Version guarantees: (1) concurrent saves on the same Order raise  ObjectOptimisticLockingFailureException,
-// proves the version predicate is in the UPDATE; (2) when two reapers race the same expired order
-// the second's stale save fails and inventory is released exactly once.
+// Integration tests for the SKIP LOCKED per-order reaper: @Version mechanics,
+// multi-instance coordination, PAYING-not-cancelled invariant, and backlog drain.
 class OrderConcurrencyRaceTest extends IntegrationTestBase {
 
     @Autowired private OrderService         orderService;
@@ -46,6 +51,7 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
 
     @BeforeEach
     void setUp() {
+        // deletion order matters: FK constraints orders -> ticket_types -> events
         orderRepository.deleteAll();
         inventoryRepository.deleteAll();
         ticketTypeRepository.deleteAll();
@@ -69,7 +75,7 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
     }
 
     @Test
-    void concurrent_modifications_to_same_order_throw_optimistic_lock_exception() {
+    void at_version_concurrent_modifications_raise_optimistic_lock_exception() {
         String orderNo = createOrder();
         Long orderId = orderRepository.findByOrderNo(orderNo).orElseThrow().getId();
 
@@ -96,39 +102,132 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
     }
 
     @Test
-    void second_reaper_with_stale_snapshot_fails_when_first_reaper_already_cancelled() {
-        // Simulates two reaper instances picking up the same expired order.
-        // First one wins; second's stale save must fail, inventory released exactly once.
-        String orderNo = createAndExpireOrder();
-        Long orderId = orderRepository.findByOrderNo(orderNo).orElseThrow().getId();
+    void skip_locked_second_reaper_skips_row_held_by_first_reaper() throws Exception {
+        // While reaper A holds the lock, reaper B must skip the row (not block) and return empty.
+        createAndExpireCreatedOrder();
+        assertThat(currentExpiredCreatedCount()).isEqualTo(1);
 
-        assertThat(currentStock()).isEqualTo(INITIAL_STOCK - 1);
+        CountDownLatch reaperALocked   = new CountDownLatch(1);
+        CountDownLatch reaperBQueried  = new CountDownLatch(1);
+        AtomicInteger  reaperASawCount = new AtomicInteger(-1);
+        AtomicInteger  reaperBSawCount = new AtomicInteger(-1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
 
-        Order reaperBSnapshot = loadDetachedWithHistory(orderId);
-        Long versionAtLoad = reaperBSnapshot.getVersion();
+        Thread reaperA = new Thread(() -> {
+            try {
+                transactionTemplate.executeWithoutResult(s -> {
+                    List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
+                            Instant.now(), PageRequest.of(0, 10));
+                    reaperASawCount.set(locked.size());
+                    reaperALocked.countDown();
 
-        // Reaper A: production path re-loads internally, transitions, releases inventory
-        orderService.cancelOrderBySystem(orderNo);
+                    // Hold the row lock until reaper B has run its query
+                    try {
+                        reaperBQueried.await(5, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    // TX commits on exit, releasing the lock
+                });
+            } catch (Throwable t) {
+                failure.compareAndSet(null, t);
+                reaperALocked.countDown();  // release B even on failure so test doesn't hang
+            }
+        }, "reaperA");
 
-        // Reaper B: stale snapshot still has version N; DB now has N+1 -> zero rows matched
-        assertThatThrownBy(() -> transactionTemplate.executeWithoutResult(s -> {
-            reaperBSnapshot.transitionTo(OrderStatus.CANCELLED,
-                    OrderEvent.SYSTEM_TIMEOUT, "reaper B stale");
-            orderRepository.saveAndFlush(reaperBSnapshot);
-        })).isInstanceOf(ObjectOptimisticLockingFailureException.class);
+        Thread reaperB = new Thread(() -> {
+            try {
+                if (!reaperALocked.await(5, TimeUnit.SECONDS)) {
+                    failure.compareAndSet(null,
+                            new AssertionError("reaperA never signaled lock acquisition"));
+                    return;
+                }
+                transactionTemplate.executeWithoutResult(s -> {
+                    List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
+                            Instant.now(), PageRequest.of(0, 10));
+                    reaperBSawCount.set(locked.size());
+                });
+            } catch (Throwable t) {
+                failure.compareAndSet(null, t);
+            } finally {
+                reaperBQueried.countDown();  // always unblock A
+            }
+        }, "reaperB");
 
+        reaperA.start();
+        reaperB.start();
+        reaperA.join(10_000);
+        reaperB.join(10_000);
+
+        if (failure.get() != null) {
+            throw new AssertionError("test thread failed", failure.get());
+        }
+
+        assertThat(reaperASawCount.get())
+                .as("reaper A should have acquired the lock on the one expired CREATED order")
+                .isEqualTo(1);
+        assertThat(reaperBSawCount.get())
+                .as("reaper B should have skipped the row locked by reaper A and seen nothing")
+                .isZero();
+    }
+
+    @Test
+    void payment_in_progress_order_is_not_cancelled_even_when_expired() {
+        // Scenario: user clicks pay just before expiredAt; reaper polls afterward.
+        // CREATED-only WHERE clause means the reaper never sees PAYING, it gets out of the way.
+        String orderNo = createOrder();
+        orderService.payOrder(USER_ID, orderNo);  // CREATED -> PAYING
+
+        // expire the PAYING order (simulates time passing past expiredAt)
+        transactionTemplate.executeWithoutResult(s -> {
+            Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
+            order.expireNow();
+            orderRepository.save(order);
+        });
+
+        // Drain reaper. It must skip the PAYING order entirely.
+        int processed = 0;
+        while (orderService.processOneExpiredOrder()) {
+            processed++;
+        }
+
+        assertThat(processed)
+                .as("reaper must not process any PAYING order, even when expired")
+                .isZero();
         Order finalOrder = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        assertThat(finalOrder.getStatus()).isEqualTo(OrderStatus.CANCELLED);
-        assertThat(finalOrder.getVersion())
-                .as("only reaper A's commit should have bumped the version")
-                .isEqualTo(versionAtLoad + 1);
+        assertThat(finalOrder.getStatus())
+                .as("PAYING order with payment in flight must remain PAYING")
+                .isEqualTo(OrderStatus.PAYING);
         assertThat(currentStock())
-                .as("inventory released exactly once despite two reapers attempting cancel")
+                .as("inventory must remain held while user is paying")
+                .isEqualTo(INITIAL_STOCK - 1);
+    }
+
+    @Test
+    void reaper_drains_expired_created_backlog_one_order_per_transaction() {
+        String o1 = createAndExpireCreatedOrder();
+        String o2 = createAndExpireCreatedOrder();
+        String o3 = createAndExpireCreatedOrder();
+
+        assertThat(currentStock()).isEqualTo(INITIAL_STOCK - 3);
+
+        int processed = 0;
+        while (orderService.processOneExpiredOrder()) {
+            processed++;
+        }
+
+        assertThat(processed).isEqualTo(3);
+        for (String orderNo : List.of(o1, o2, o3)) {
+            assertThat(orderRepository.findByOrderNo(orderNo).orElseThrow().getStatus())
+                    .isEqualTo(OrderStatus.CANCELLED);
+        }
+        assertThat(currentStock())
+                .as("all three reservations released back to pool")
                 .isEqualTo(INITIAL_STOCK);
     }
 
-    // Loads an Order and force-initializes statusHistory inside the TX so the
-    // returned detached entity is safe to call transitionTo() on.
+    // Loads an Order and force-initializes statusHistory inside the TX so the returned detached entity
+    // is safe to call transitionTo() on.
     private Order loadDetachedWithHistory(Long orderId) {
         return transactionTemplate.execute(s -> {
             Order o = orderRepository.findById(orderId).orElseThrow();
@@ -142,13 +241,20 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
                 .orElseThrow().getAvailableStock();
     }
 
+    private long currentExpiredCreatedCount() {
+        return orderRepository.findAll().stream()
+                .filter(o -> o.getStatus() == OrderStatus.CREATED)
+                .filter(Order::isExpired)
+                .count();
+    }
+
     private String createOrder() {
         return orderService.createOrder(USER_ID,
                         CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()))
                 .getOrderNo();
     }
 
-    private String createAndExpireOrder() {
+    private String createAndExpireCreatedOrder() {
         String orderNo = createOrder();
         transactionTemplate.executeWithoutResult(s -> {
             Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
