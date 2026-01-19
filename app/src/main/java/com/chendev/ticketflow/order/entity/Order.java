@@ -69,10 +69,16 @@ public class Order {
     @Column(unique = true, nullable = false, length = 64)
     private String requestId;
 
+    //cart hold deadline, set once at creation, used by the reaper to release CREATED orders.
     @Column(nullable = false)
     private Instant expiredAt;
 
-    // Long (not int) per JPA convention, avoids overflow on long-lived entities
+    //payment completion deadline, NULL until CREATED->PAYING.
+    //a payment started before the cart deadline must finish within its own window.
+    @Column(name = "payment_expired_at")
+    private Instant paymentExpiredAt;
+
+    //Long (not int) per JPA convention, avoids overflow on long-lived entities
     @Version
     @Column(nullable = false)
     private Long version;
@@ -90,7 +96,7 @@ public class Order {
 
     public static Order create(String orderNo, Long userId, Long ticketTypeId,
                                int quantity, BigDecimal unitPrice, String requestId,
-                               Duration paymentWindow) {
+                               Duration cartWindow) {
         Order order = new Order();
         order.orderNo = orderNo;
         order.userId = userId;
@@ -100,7 +106,8 @@ public class Order {
         order.totalAmount = unitPrice.multiply(BigDecimal.valueOf(quantity));
         order.status = OrderStatus.CREATED;
         order.requestId = requestId;
-        order.expiredAt = Instant.now().plus(paymentWindow);
+        order.expiredAt = Instant.now().plus(cartWindow);
+        //paymentExpiredAt remains NULL until startPaymentWindow() is called
         return order;
     }
 
@@ -114,10 +121,29 @@ public class Order {
         statusHistory.add(OrderStatusHistory.record(this, this.status, newStatus, event, reason));
         this.status = newStatus;
     }
-    //null guard is defensive:protects against Order instances created outside of create() in tests
-    public boolean isExpired() {
+
+    //called once at CREATED->PAYING. Guard prevents re-calling which would shift the deadline forward.
+    public void startPaymentWindow(Duration paymentWindow) {
+        if (this.paymentExpiredAt != null) {
+            throw DomainException.of(ResultCode.INVALID_STATE_TRANSITION,
+                    "payment window already started for this order");
+        }
+        this.paymentExpiredAt = Instant.now().plus(paymentWindow);
+    }
+
+    //only meaningful in CREATED; use isPaymentExpired() for PAYING. null guard for test-built instances.
+    public boolean isCartExpired() {
         return expiredAt != null && Instant.now().isAfter(expiredAt);
     }
-    //test helper: forces expiredAt into the past so the reaper picks it up immediately
+
+    //returns false if no payment attempt has started (NULL), safe to call on CREATED orders.
+    public boolean isPaymentExpired() {
+        return paymentExpiredAt != null && Instant.now().isAfter(paymentExpiredAt);
+    }
+
+    //test helper: forces cart deadline into the past so the reaper picks it up immediately
     public void expireNow() { this.expiredAt = Instant.now().minusSeconds(1); }
+
+    //test helper: forces payment deadline into the past so confirmPayment() rejects
+    public void expirePaymentNow() { this.paymentExpiredAt = Instant.now().minusSeconds(1); }
 }

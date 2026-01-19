@@ -17,7 +17,10 @@ public class OrderResponse {
     private final BigDecimal unitPrice;
     private final BigDecimal totalAmount;
     private final OrderStatus status;
+    //cart hold deadline, user can no longer initiate payment after this
     private final Instant expiredAt;
+    //payment completion deadline, null until user clicks pay; frontend shows this timer in PAYING state
+    private final Instant paymentExpiredAt;
     private final Instant createdAt;
 
     public OrderResponse(Order order) {
@@ -29,6 +32,7 @@ public class OrderResponse {
         this.totalAmount = order.getTotalAmount();
         this.status = order.getStatus();
         this.expiredAt = order.getExpiredAt();
+        this.paymentExpiredAt = order.getPaymentExpiredAt();
         this.createdAt = order.getCreatedAt();
     }
 }

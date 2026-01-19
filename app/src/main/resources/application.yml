@@ -107,7 +107,10 @@ security:
 
 ticketflow:
   order:
-    payment-window-minutes: 15
+    # two-tier expiry: cart-window is how long a CREATED order survives before the reaper;
+    # payment-window starts when the user clicks pay, sized for gateway round-trip + 3DS
+    cart-window-minutes: 15
+    payment-window-minutes: 5
   timeout:
     fixed-delay: 60000
     max-per-cycle: 5000 # caps runaway loops if backlog spikes; remainder deferred to next tick

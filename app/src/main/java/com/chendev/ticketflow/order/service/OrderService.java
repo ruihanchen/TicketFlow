@@ -36,7 +36,12 @@ public class OrderService {
     private final InventoryPort   inventoryPort;
     private final EventPort       eventPort;
 
-    @Value("${ticketflow.order.payment-window-minutes:15}")
+    //cart hold window: how long a CREATED order survives before the reaper releases it
+    @Value("${ticketflow.order.cart-window-minutes:15}")
+    private int cartWindowMinutes;
+
+    //payment completion window: starts when user clicks pay, sized for gateway round-trip + 3DS
+    @Value("${ticketflow.order.payment-window-minutes:5}")
     private int paymentWindowMinutes;
 
     @Transactional
@@ -71,7 +76,7 @@ public class OrderService {
         Order order = Order.create(
                 orderNo, userId, req.getTicketTypeId(), req.getQuantity(),
                 ticketTypeInfo.price(), req.getRequestId(),
-                Duration.ofMinutes(paymentWindowMinutes));
+                Duration.ofMinutes(cartWindowMinutes));
 
         try {
             orderRepository.save(order);
@@ -91,21 +96,24 @@ public class OrderService {
     @Transactional
     public OrderResponse payOrder(Long userId, String orderNo) {
         Order order = findByOrderNoForUser(orderNo, userId);
-        // checked after ownership lookup, unauthorized callers can't probe order state via expiry errors
-        rejectIfExpired(order);
+        //cart deadline check, unauthorized callers can't probe order state via expiry errors
+        rejectIfCartExpired(order);
         order.transitionTo(OrderStatus.PAYING, OrderEvent.INITIATE_PAYMENT,
                 "payment initiated");
+        //starts the payment deadline; cart deadline is irrelevant for this order from here on
+        order.startPaymentWindow(Duration.ofMinutes(paymentWindowMinutes));
         orderRepository.save(order);
-        log.info("[Order] paying: orderNo={}", orderNo);
+        log.info("[Order] paying: orderNo={}, paymentExpiredAt={}",
+                orderNo, order.getPaymentExpiredAt());
         return new OrderResponse(order);
     }
 
     @Transactional
     public OrderResponse confirmPayment(Long userId, String orderNo) {
         Order order = findByOrderNoForUser(orderNo, userId);
-        // defense in depth: payOrder() may have slipped through just before expiry; confirming after expiry
-        // would leave the user with a PAID order the reaper already released
-        rejectIfExpired(order);
+        //payment deadline check, not cart deadline, the user is entitled to their full payment window
+        //even if the cart deadline elapsed during the gateway round-trip
+        rejectIfPaymentExpired(order);
         order.transitionTo(OrderStatus.PAID, OrderEvent.PAYMENT_SUCCESS,
                 "payment confirmed");
         orderRepository.save(order);
@@ -123,7 +131,8 @@ public class OrderService {
     // returns true if an order was processed, false when the backlog is empty
     @Transactional
     public boolean processOneExpiredOrder() {
-        // SKIP LOCKED: two reaper instances each get a disjoint set of rows, no external lock needed
+        //SKIP LOCKED: concurrent reapers get disjoint rows, no external lock needed query is hardcoded
+        //to CREATED only, PAYING orders are never the reaper's concern
         List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
                 Instant.now(), PageRequest.of(0, 1));
 
@@ -132,12 +141,11 @@ public class OrderService {
         }
 
         Order order = locked.get(0);
-        // PAYING orders never reach here, WHERE clause is hardcoded to CREATED only
         order.transitionTo(OrderStatus.CANCELLED, OrderEvent.SYSTEM_TIMEOUT,
                 "payment window expired");
-        // transitionTo() validates state machine and writes statusHistory even though status is guaranteed CREATED
+        //transitionTo() validates state machine and writes statusHistory even though status is guaranteed CREATED
         inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
-        // order is managed; no explicit save needed(@Version increments at flush)
+        //order is managed; no explicit save needed(@Version increments at flush)
         log.info("[Order] cancelled by system: orderNo={}", order.getOrderNo());
         return true;
     }
@@ -166,9 +174,16 @@ public class OrderService {
                 .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND));
     }
 
-    // extracted so payOrder() and confirmPayment() share identical expiry semantics
-    private void rejectIfExpired(Order order) {
-        if (order.isExpired()) {
+    //cart-deadline guard: payOrder() only; confirmPayment() uses rejectIfPaymentExpired()
+    private void rejectIfCartExpired(Order order) {
+        if (order.isCartExpired()) {
+            throw DomainException.of(ResultCode.ORDER_EXPIRED);
+        }
+    }
+
+    //payment-deadline guard: NULL paymentExpiredAt means no attempt started; safe to call on any state
+    private void rejectIfPaymentExpired(Order order) {
+        if (order.isPaymentExpired()) {
             throw DomainException.of(ResultCode.ORDER_EXPIRED);
         }
     }

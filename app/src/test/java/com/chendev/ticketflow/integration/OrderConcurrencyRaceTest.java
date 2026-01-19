@@ -45,8 +45,11 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
     @Autowired private InventoryService     inventoryService;
     @Autowired private TransactionTemplate  transactionTemplate;
 
-    private static final int  INITIAL_STOCK = 5;
-    private static final Long USER_ID       = 1L;
+    private static final int        INITIAL_STOCK   = 5;
+    private static final Long       USER_ID         = 1L;
+    private static final BigDecimal TICKET_PRICE    = new BigDecimal("100.00");
+    private static final int        REAPER_PAGE_SIZE = 10;  // larger than any batch in these tests
+
     private Long ticketTypeId;
 
     @BeforeEach
@@ -66,8 +69,7 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
         event.publish();
         eventRepository.save(event);
 
-        TicketType tt = TicketType.create(event, "General",
-                new BigDecimal("100.00"), INITIAL_STOCK);
+        TicketType tt = TicketType.create(event, "General", TICKET_PRICE, INITIAL_STOCK);
         ticketTypeRepository.save(tt);
         ticketTypeId = tt.getId();
 
@@ -117,11 +119,11 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
             try {
                 transactionTemplate.executeWithoutResult(s -> {
                     List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
-                            Instant.now(), PageRequest.of(0, 10));
+                            Instant.now(), PageRequest.of(0, REAPER_PAGE_SIZE));
                     reaperASawCount.set(locked.size());
                     reaperALocked.countDown();
 
-                    // Hold the row lock until reaper B has run its query
+                    // hold the row lock until reaper B has run its query
                     try {
                         reaperBQueried.await(5, TimeUnit.SECONDS);
                     } catch (InterruptedException e) {
@@ -144,7 +146,7 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
                 }
                 transactionTemplate.executeWithoutResult(s -> {
                     List<Order> locked = orderRepository.findExpiredCreatedForUpdate(
-                            Instant.now(), PageRequest.of(0, 10));
+                            Instant.now(), PageRequest.of(0, REAPER_PAGE_SIZE));
                     reaperBSawCount.set(locked.size());
                 });
             } catch (Throwable t) {
@@ -173,26 +175,25 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
 
     @Test
     void payment_in_progress_order_is_not_cancelled_even_when_expired() {
-        // Scenario: user clicks pay just before expiredAt; reaper polls afterward.
-        // CREATED-only WHERE clause means the reaper never sees PAYING, it gets out of the way.
+        // Scenario: user clicks pay just before the cart deadline; reaper polls afterward.
+        // Reaper's WHERE clause is hardcoded to CREATED only -- PAYING orders are never touched.
         String orderNo = createOrder();
         orderService.payOrder(USER_ID, orderNo);  // CREATED -> PAYING
 
-        // expire the PAYING order (simulates time passing past expiredAt)
+        // expire the cart deadline of the now-PAYING order; reaper must still skip it
         transactionTemplate.executeWithoutResult(s -> {
             Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
             order.expireNow();
             orderRepository.save(order);
         });
 
-        // Drain reaper. It must skip the PAYING order entirely.
         int processed = 0;
         while (orderService.processOneExpiredOrder()) {
             processed++;
         }
 
         assertThat(processed)
-                .as("reaper must not process any PAYING order, even when expired")
+                .as("reaper must not process any PAYING order, even when cart deadline passed")
                 .isZero();
         Order finalOrder = orderRepository.findByOrderNo(orderNo).orElseThrow();
         assertThat(finalOrder.getStatus())
@@ -226,8 +227,8 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
                 .isEqualTo(INITIAL_STOCK);
     }
 
-    // Loads an Order and force-initializes statusHistory inside the TX so the returned detached entity
-    // is safe to call transitionTo() on.
+    // force-initialize statusHistory inside the TX; transitionTo() calls add() on it,
+    // and a lazy proxy outside the TX throws LazyInitializationException before @Version fires
     private Order loadDetachedWithHistory(Long orderId) {
         return transactionTemplate.execute(s -> {
             Order o = orderRepository.findById(orderId).orElseThrow();
@@ -244,7 +245,7 @@ class OrderConcurrencyRaceTest extends IntegrationTestBase {
     private long currentExpiredCreatedCount() {
         return orderRepository.findAll().stream()
                 .filter(o -> o.getStatus() == OrderStatus.CREATED)
-                .filter(Order::isExpired)
+                .filter(Order::isCartExpired)
                 .count();
     }
 

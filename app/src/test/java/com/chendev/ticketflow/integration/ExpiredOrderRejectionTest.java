@@ -26,8 +26,8 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-// Guards against paying an expired order. Without this check, OrderTimeoutService could race the user's payment on
-// the next polling cycle,releasing inventory while the user believes payment is in progress.
+// Two-tier expiry: cart deadline guards payOrder; payment deadline guards confirmPayment.
+// Splits the old single-deadline model that rejected in-flight payments confirmed past expiredAt.
 class ExpiredOrderRejectionTest extends IntegrationTestBase {
 
     @Autowired private OrderService         orderService;
@@ -37,8 +37,10 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
     @Autowired private TicketTypeRepository ticketTypeRepository;
     @Autowired private InventoryService     inventoryService;
 
-    private static final int  INITIAL_STOCK = 5;
-    private static final Long USER_ID       = 1L;
+    private static final int        INITIAL_STOCK = 5;
+    private static final Long       USER_ID       = 1L;
+    private static final BigDecimal TICKET_PRICE  = new BigDecimal("100.00");
+
     private Long ticketTypeId;
 
     @BeforeEach
@@ -57,8 +59,7 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
         event.publish();
         eventRepository.save(event);
 
-        TicketType tt = TicketType.create(event, "General",
-                new BigDecimal("100.00"), INITIAL_STOCK);
+        TicketType tt = TicketType.create(event, "General", TICKET_PRICE, INITIAL_STOCK);
         ticketTypeRepository.save(tt);
         ticketTypeId = tt.getId();
 
@@ -66,29 +67,24 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
     }
 
     @Test
-    void expired_order_cannot_initiate_payment() {
-        String orderNo = createAndExpireOrder();
+    void cart_expired_order_cannot_initiate_payment() {
+        String orderNo = createAndExpireCart();
 
         assertThatThrownBy(() -> orderService.payOrder(USER_ID, orderNo))
                 .isInstanceOf(DomainException.class)
                 .extracting(e -> ((DomainException) e).getResultCode())
                 .isEqualTo(ResultCode.ORDER_EXPIRED);
 
-        // status must stay CREATED, if the guard threw via transition instead, this assertion would
-        // silently pass on the wrong invariant
         Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(OrderStatus.CREATED);
     }
 
     @Test
-    void expired_order_cannot_confirm_payment() {
-        // payment was initiated before expiry but confirmation arrived after payment gateway latency
-        // pushed past the window
+    void payment_expired_order_cannot_confirm_payment() {
         String orderNo = createOrder();
         orderService.payOrder(USER_ID, orderNo);
-
         Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        order.expireNow();
+        order.expirePaymentNow();
         orderRepository.save(order);
 
         assertThatThrownBy(() -> orderService.confirmPayment(USER_ID, orderNo))
@@ -101,8 +97,23 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
     }
 
     @Test
+    void in_flight_payment_succeeds_even_when_cart_deadline_passed() {
+        // cart deadline passed during gateway round-trip; payment must still go through
+        String orderNo = createOrder();
+        orderService.payOrder(USER_ID, orderNo);
+        Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
+        order.expireNow();  // expires cart; paymentExpiredAt remains in the future
+        orderRepository.save(order);
+        orderService.confirmPayment(USER_ID, orderNo);
+
+        Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
+        assertThat(reloaded.getStatus())
+                .as("in-flight payment within payment window must finalize regardless of cart deadline")
+                .isEqualTo(OrderStatus.PAID);
+    }
+
+    @Test
     void unexpired_order_can_pay_normally() {
-        // guard must not reject valid requests
         String orderNo = createOrder();
 
         orderService.payOrder(USER_ID, orderNo);
@@ -118,7 +129,7 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
         return response.getOrderNo();
     }
 
-    private String createAndExpireOrder() {
+    private String createAndExpireCart() {
         String orderNo = createOrder();
         Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
         order.expireNow();
