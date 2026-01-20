@@ -100,6 +100,12 @@
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
+        <!-- UUIDv7 for orderNo generation; JDK 21 has no built-in UUIDv7 -->
+        <dependency>
+            <groupId>com.github.f4b6a3</groupId>
+            <artifactId>uuid-creator</artifactId>
+            <version>6.1.1</version>
+        </dependency>
 
         <!-- Test -->
         <dependency>

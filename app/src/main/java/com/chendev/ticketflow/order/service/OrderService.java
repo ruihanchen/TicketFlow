@@ -5,6 +5,7 @@ import com.chendev.ticketflow.common.response.ResultCode;
 import com.chendev.ticketflow.order.dto.CreateOrderRequest;
 import com.chendev.ticketflow.order.dto.OrderResponse;
 import com.chendev.ticketflow.order.entity.Order;
+import com.chendev.ticketflow.order.factory.OrderNoFactory;
 import com.chendev.ticketflow.order.port.EventPort;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import com.chendev.ticketflow.order.port.InventoryPort.DeductionResult;
@@ -25,7 +26,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.UUID;
 
 @Slf4j
 @Service
@@ -35,6 +35,7 @@ public class OrderService {
     private final OrderRepository orderRepository;
     private final InventoryPort   inventoryPort;
     private final EventPort       eventPort;
+    private final OrderNoFactory  orderNoFactory;
 
     //cart hold window: how long a CREATED order survives before the reaper releases it
     @Value("${ticketflow.order.cart-window-minutes:15}")
@@ -70,8 +71,7 @@ public class OrderService {
             throw DomainException.of(ResultCode.INVENTORY_LOCK_FAILED);
         }
 
-        String orderNo = "TF" + System.currentTimeMillis()
-                + UUID.randomUUID().toString().substring(0, 6).toUpperCase();
+        String orderNo = orderNoFactory.create();
 
         Order order = Order.create(
                 orderNo, userId, req.getTicketTypeId(), req.getQuantity(),
@@ -82,9 +82,11 @@ public class OrderService {
             orderRepository.save(order);
             orderRepository.flush();
         } catch (DataIntegrityViolationException e) {
-            // TX rollback undoes guardDeduct; no Redis compensation needed, DB is the only inventory writer.
+            // UUIDv7 makes orderNo collisions impossible; this can only be a duplicate requestId from a concurrent
+            // insert that slipped past the existsByRequestId fast-path above. TX rollback already undoes
+            // the inventory deduction
             throw DomainException.of(ResultCode.DUPLICATE_REQUEST,
-                    "order already exists for this requestId", e);
+                    "duplicate requestId after concurrent insert", e);
         }
 
         log.info("[Order] created: orderNo={}, userId={}, ticketTypeId={}",
