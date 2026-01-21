@@ -6,16 +6,17 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-// Static counters (oversellCounter) exist for JPA entities, which Hibernate instantiates
-// outside Spring, DI is unavailable there, so static accessors are the only option.
-// Instance counters (cache hit/miss/fallthrough) are for Spring services; no static indirection needed.
+// All counters are instance-based, injected into Spring services via constructor.
+// Entities (Hibernate-managed) can't use DI, metrics calls belong in services.
 @Component
 @RequiredArgsConstructor
 public class InventoryMetrics {
 
     private final MeterRegistry registry;
 
-    private static Counter oversellCounter;
+    // fires when guardDeduct returns affected=0, stock was insufficient for the request.
+    // named "insufficient_stock" not "oversell" because guardDeduct makes oversell impossible.
+    private Counter insufficientStock;
 
     private Counter cacheHits;
     private Counter cacheMisses;
@@ -23,8 +24,8 @@ public class InventoryMetrics {
 
     @PostConstruct
     void init() {
-        oversellCounter = Counter.builder("ticketflow_inventory_oversell_total")
-                .description("deduct() called with insufficient stock; must always be 0 in healthy operation")
+        insufficientStock = Counter.builder("ticketflow_inventory_insufficient_stock_total")
+                .description("guardDeduct returned affected=0; stock was insufficient for the requested quantity")
                 .register(registry);
 
         cacheHits = Counter.builder("ticketflow_inventory_query_cache_hits_total")
@@ -40,11 +41,8 @@ public class InventoryMetrics {
                 .register(registry);
     }
 
-    public static void recordOversellAttempt() {
-        // null guard: Hibernate may instantiate Inventory before @PostConstruct runs
-        if (oversellCounter != null) {
-            oversellCounter.increment();
-        }
+    public void recordInsufficientStock() {
+        insufficientStock.increment();
     }
 
     public void recordCacheHit() {

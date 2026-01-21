@@ -335,12 +335,12 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "ticketflow_inventory_oversell_total",
-          "legendFormat": "oversells",
+          "expr": "ticketflow_inventory_insufficient_stock_total",
+          "legendFormat": "insufficient stock",
           "refId": "A"
         }
       ],
-      "title": "Oversell Counter (must always be 0)",
+      "title": "Insufficient Stock (deduction rejected by guardDeduct)",
       "type": "stat"
     },
     {

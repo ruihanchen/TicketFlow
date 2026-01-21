@@ -2,6 +2,7 @@ package com.chendev.ticketflow.inventory.service;
 
 import com.chendev.ticketflow.common.exception.DomainException;
 import com.chendev.ticketflow.common.response.ResultCode;
+import com.chendev.ticketflow.infrastructure.metrics.InventoryMetrics;
 import com.chendev.ticketflow.inventory.entity.Inventory;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort.DeductionResult;
@@ -16,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class InventoryService {
 
     private final InventoryRepository inventoryRepository;
+    private final InventoryMetrics inventoryMetrics;
 
     @Transactional
     public void initStock(Long ticketTypeId, int totalStock) {
@@ -47,6 +49,8 @@ public class InventoryService {
     public DeductionResult dbDeduct(Long ticketTypeId, int quantity) {
         int affected = inventoryRepository.guardDeduct(ticketTypeId, quantity);
         if (affected == 0) {
+            // flash sale signal: rate here = users turned away by stock depletion
+            inventoryMetrics.recordInsufficientStock();
             return DeductionResult.INSUFFICIENT;
         }
         log.debug("[Inventory] DB deducted: ticketTypeId={}, qty={}", ticketTypeId, quantity);

@@ -3,7 +3,6 @@ package com.chendev.ticketflow.inventory.entity;
 import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
-import com.chendev.ticketflow.infrastructure.metrics.InventoryMetrics;
 
 import java.time.Instant;
 
@@ -46,13 +45,11 @@ public class Inventory {
         return inv;
     }
 
-    //InventoryService checks availableStock before calling deduct();reaching here means a caller bug.
-    //IllegalStateException(not DomainException): this is a programming error, not a business rule violation
+    // reaching here means a caller bug, InventoryService checks availableStock before calling deduct().
+    // IllegalStateException, not DomainException: programming error, not a business rule violation.
+    // no metrics: entities must not depend on Spring infrastructure; counter lives in InventoryService.dbDeduct.
     public void deduct(int quantity) {
         if (this.availableStock < quantity) {
-            //should never reach here, InventoryService checks stock before calling deduct(),
-            //counter increment fires observability alert; exception stops the operation.
-            InventoryMetrics.recordOversellAttempt();
             throw new IllegalStateException(
                     "cannot deduct " + quantity + " from " + availableStock);
         }
