@@ -1,5 +1,6 @@
 package com.chendev.ticketflow.infrastructure.adapter;
 
+import com.chendev.ticketflow.inventory.port.DeductionResult;
 import com.chendev.ticketflow.inventory.service.InventoryService;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;

@@ -3,7 +3,7 @@ package com.chendev.ticketflow.integration;
 import com.chendev.ticketflow.IntegrationTestBase;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.inventory.service.InventoryService;
-import com.chendev.ticketflow.order.port.InventoryPort.DeductionResult;
+import com.chendev.ticketflow.inventory.port.DeductionResult;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

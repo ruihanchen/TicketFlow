@@ -1,12 +1,10 @@
 package com.chendev.ticketflow.order.port;
 
-public interface InventoryPort {
+import com.chendev.ticketflow.inventory.port.DeductionResult;
 
-    enum DeductionResult {
-        SUCCESS,
-        INSUFFICIENT,
-        LOCK_CONFLICT,  // @Version conflict:caller returns 503, client should retry
-    }
+// Order domain's outbound port for inventory. DeductionResult lives in inventory.port
+// (the producer) so the dependency flows order → inventory, not the reverse.
+public interface InventoryPort {
 
     DeductionResult deductStock(Long ticketTypeId, int quantity);
 
