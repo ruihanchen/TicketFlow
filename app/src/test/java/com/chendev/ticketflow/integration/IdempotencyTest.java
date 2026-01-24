@@ -110,10 +110,6 @@ class IdempotencyTest extends IntegrationTestBase {
                         // passed existsByRequestId but lost the race to INSERT;
                         // DB unique constraint on request_id caught it
                         duplicates.incrementAndGet();
-                    } else if (e.getResultCode() == ResultCode.INVENTORY_LOCK_FAILED) {
-                        // threads raced past existsByRequestId, then hit the inventory lock;
-                        // loser gets LOCK_FAILED before reaching the duplicate check, but only one order exists
-                        duplicates.incrementAndGet();
                     } else {
                         unexpectedErr.compareAndSet(null, e);
                     }

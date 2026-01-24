@@ -8,8 +8,8 @@ import com.chendev.ticketflow.order.port.TicketTypeInfo;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-// reads from TicketTypeRepository directly currently;
-// OrderService and EventPort never change.
+// Bridges Order domain → Event domain for ticket-type lookups.
+// Hits TicketTypeRepository directly, no reason to route through EventService.
 @Component
 @RequiredArgsConstructor
 public class EventAdapter implements EventPort {
@@ -18,7 +18,7 @@ public class EventAdapter implements EventPort {
 
     @Override
     public TicketTypeInfo getTicketTypeInfo(Long ticketTypeId) {
-        return ticketTypeRepository.findById(ticketTypeId)
+        return ticketTypeRepository.findByIdWithEvent(ticketTypeId)
                 .map(tt -> new TicketTypeInfo(
                         tt.getId(),
                         tt.getEvent().getId(),

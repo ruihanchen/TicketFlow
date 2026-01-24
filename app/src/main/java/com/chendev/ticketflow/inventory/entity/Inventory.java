@@ -55,9 +55,4 @@ public class Inventory {
         }
         this.availableStock -= quantity;
     }
-
-    public void release(int quantity) {
-        //cap at totalStock:double release would otherwise push availableStock above the original allocation
-        this.availableStock = Math.min(availableStock + quantity, totalStock);
-    }
 }

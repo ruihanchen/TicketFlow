@@ -65,11 +65,6 @@ public class OrderService {
         if (result == DeductionResult.INSUFFICIENT) {
             throw DomainException.of(ResultCode.INSUFFICIENT_STOCK);
         }
-        if (result == DeductionResult.LOCK_CONFLICT) {
-            // @Version conflict path;only reachable via ConcurrentInventoryTest (direct InventoryService call).
-            // InventoryAdapter uses conditional UPDATE and never returns LOCK_CONFLICT.
-            throw DomainException.of(ResultCode.INVENTORY_LOCK_FAILED);
-        }
 
         String orderNo = orderNoFactory.create();
 
