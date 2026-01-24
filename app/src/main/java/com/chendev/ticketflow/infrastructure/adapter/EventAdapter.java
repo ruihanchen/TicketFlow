@@ -8,8 +8,8 @@ import com.chendev.ticketflow.order.port.TicketTypeInfo;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-// Bridges Order domain → Event domain for ticket-type lookups.
-// Hits TicketTypeRepository directly, no reason to route through EventService.
+// Order -> Event adapter. Bypasses EventService, pure data projection, no business logic.
+// findByIdWithEvent JOIN FETCH Event to avoid lazy proxy outside the caller's session.
 @Component
 @RequiredArgsConstructor
 public class EventAdapter implements EventPort {
@@ -23,8 +23,7 @@ public class EventAdapter implements EventPort {
                         tt.getId(),
                         tt.getEvent().getId(),
                         tt.getPrice(),
-                        tt.getEvent().isOnSale()
-                ))
+                        tt.getEvent().isOnSale()))
                 .orElseThrow(() -> DomainException.of(ResultCode.TICKET_TYPE_NOT_FOUND));
     }
 }
