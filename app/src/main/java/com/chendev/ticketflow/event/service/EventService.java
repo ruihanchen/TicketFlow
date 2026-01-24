@@ -4,7 +4,7 @@ import org.springframework.stereotype.Service;
 import lombok.RequiredArgsConstructor;
 import com.chendev.ticketflow.event.repository.EventRepository;
 import com.chendev.ticketflow.event.repository.TicketTypeRepository;
-import com.chendev.ticketflow.inventory.service.InventoryService;
+import com.chendev.ticketflow.event.port.InventoryInitPort;
 import com.chendev.ticketflow.event.entity.Event;
 import com.chendev.ticketflow.event.dto.CreateEventRequest;
 import com.chendev.ticketflow.event.dto.EventResponse;
@@ -32,7 +32,7 @@ public class EventService {
 
     private final EventRepository eventRepository;
     private final TicketTypeRepository ticketTypeRepository;
-    private final InventoryService inventoryService;
+    private final InventoryInitPort inventoryInitPort;
 
     @Transactional
     public EventResponse createEvent(CreateEventRequest req) {
@@ -46,7 +46,8 @@ public class EventService {
                     TicketType ticketType = TicketType.create(
                             event, tt.getName(), tt.getPrice(), tt.getTotalStock());
                     ticketTypeRepository.save(ticketType);
-                    inventoryService.initStock(ticketType.getId(), tt.getTotalStock());
+                    // port call keeps event domain from depending on inventory's service package directly
+                    inventoryInitPort.initStock(ticketType.getId(), tt.getTotalStock());
                     return ticketType;
                 })
                 .toList();
