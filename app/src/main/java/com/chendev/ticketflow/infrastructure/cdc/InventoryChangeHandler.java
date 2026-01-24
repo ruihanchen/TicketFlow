@@ -1,5 +1,6 @@
 package com.chendev.ticketflow.infrastructure.cdc;
 
+import com.chendev.ticketflow.inventory.redis.InventoryRedisKeys;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.debezium.engine.ChangeEvent;
@@ -20,7 +21,6 @@ import java.util.function.Consumer;
 @Component
 public class InventoryChangeHandler implements Consumer<ChangeEvent<String, String>> {
 
-    private static final String KEY_PREFIX = "inventory:";
     private static final String EVENTS_METRIC = "ticketflow_cdc_events_total";
     private static final String EVENTS_DESCRIPTION =
             "CDC events processed by InventoryChangeHandler, partitioned by op type";
@@ -143,7 +143,7 @@ public class InventoryChangeHandler implements Consumer<ChangeEvent<String, Stri
         }
         long ticketTypeId = after.path("ticket_type_id").asLong();
         int availableStock = after.path("available_stock").asInt();
-        String key = KEY_PREFIX + ticketTypeId;
+        String key = InventoryRedisKeys.stockKey(ticketTypeId);
         redisTemplate.opsForValue().set(key, String.valueOf(availableStock));
         log.debug("[CDC] Upsert: {} = {}", key, availableStock);
     }
@@ -161,7 +161,7 @@ public class InventoryChangeHandler implements Consumer<ChangeEvent<String, Stri
             log.warn("[CDC] Delete event has ticket_type_id=0; REPLICA IDENTITY likely not FULL. Skipping.");
             return;
         }
-        String key = KEY_PREFIX + ticketTypeId;
+        String key = InventoryRedisKeys.stockKey(ticketTypeId);
         redisTemplate.delete(key);
         log.debug("[CDC] Delete: {}", key);
     }

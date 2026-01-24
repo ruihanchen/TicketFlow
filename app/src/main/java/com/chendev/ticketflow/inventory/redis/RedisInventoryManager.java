@@ -12,13 +12,11 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class RedisInventoryManager {
 
-    private static final String KEY_PREFIX = "inventory:";
-
     private final StringRedisTemplate redisTemplate;
 
     //returns null if the key has not yet been populated by CDC or was evicted
     public Integer getStock(Long ticketTypeId) {
-        String value = redisTemplate.opsForValue().get(KEY_PREFIX + ticketTypeId);
+        String value = redisTemplate.opsForValue().get(InventoryRedisKeys.stockKey(ticketTypeId));
         return value != null ? Integer.parseInt(value) : null;
     }
 }

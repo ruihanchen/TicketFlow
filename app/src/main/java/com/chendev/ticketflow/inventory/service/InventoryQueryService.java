@@ -2,7 +2,7 @@ package com.chendev.ticketflow.inventory.service;
 
 import com.chendev.ticketflow.common.exception.DomainException;
 import com.chendev.ticketflow.common.response.ResultCode;
-import com.chendev.ticketflow.infrastructure.metrics.InventoryMetrics;
+import com.chendev.ticketflow.inventory.metrics.InventoryMetrics;
 import com.chendev.ticketflow.inventory.dto.StockView;
 import com.chendev.ticketflow.inventory.entity.Inventory;
 import com.chendev.ticketflow.inventory.redis.RedisInventoryManager;

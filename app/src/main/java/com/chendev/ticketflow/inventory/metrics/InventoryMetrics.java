@@ -1,4 +1,4 @@
-package com.chendev.ticketflow.infrastructure.metrics;
+package com.chendev.ticketflow.inventory.metrics;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -6,16 +6,15 @@ import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 
-// All counters are instance-based, injected into Spring services via constructor.
-// Entities (Hibernate-managed) can't use DI, metrics calls belong in services.
+// Instance-based counters injected into Spring services.
+// Entities can't use DI (Hibernate-managed), so metrics calls belong in the service layer.
 @Component
 @RequiredArgsConstructor
 public class InventoryMetrics {
 
     private final MeterRegistry registry;
 
-    // fires when guardDeduct returns affected=0, stock was insufficient for the request.
-    // named "insufficient_stock" not "oversell" because guardDeduct makes oversell impossible.
+    // "insufficient_stock" not "oversell", guardDeduct makes oversell impossible; this fires on affected=0
     private Counter insufficientStock;
 
     private Counter cacheHits;
