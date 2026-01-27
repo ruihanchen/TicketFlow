@@ -10,6 +10,7 @@ import com.chendev.ticketflow.inventory.service.InventoryQueryService;
 import com.chendev.ticketflow.inventory.service.InventoryService;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,99 +22,107 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
-// Integration test for the read path: real Redis + Postgres + Debezium CDC.  TICKET_TYPE_ID 999L is hermetic
-// to this class, avoids collision with other tests sharing the suite-level Spring context and MeterRegistry.
-// Redis-exception fallthrough is covered by InventoryQueryServiceFallthroughTest because (mocked)killing Testcontainers
-// Redis mid-suite is fragile.
+// Integration test for the read path with real Redis + Postgres + Debezium CDC.
+// TICKET_TYPE_ID=999L is hermetic to this class. setUp/tearDown delete only this key
+// rather than FLUSHALL to avoid wiping keys owned by other test classes.
+// Redis-exception fallthrough is covered by InventoryQueryServiceFallthroughTest (Mockito).
 class InventoryQueryServiceTest extends IntegrationTestBase {
 
-    private static final Long TICKET_TYPE_ID = 999L;
-    private static final int INITIAL_STOCK = 100;
+    private static final Long     TICKET_TYPE_ID           = 999L;
+    private static final int      INITIAL_STOCK            = 100;
+    private static final int      DEDUCT_QTY               = 30;
+    private static final int      RELEASE_TEST_QTY         = 40;
+    private static final Long     NON_EXISTENT_TICKET_TYPE = 99999L;
+    private static final String   REDIS_KEY                = "inventory:" + TICKET_TYPE_ID;
 
-    private static final Duration CDC_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration CDC_TIMEOUT   = Duration.ofSeconds(10);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
 
     @Autowired private InventoryQueryService inventoryQueryService;
-    @Autowired private InventoryService inventoryService;
-    @Autowired private InventoryRepository inventoryRepository;
+    @Autowired private InventoryService      inventoryService;
+    @Autowired private InventoryRepository   inventoryRepository;
     @Autowired private RedisInventoryManager redisInventoryManager;
-    @Autowired private StringRedisTemplate redisTemplate;
-    @Autowired private MeterRegistry meterRegistry;
+    @Autowired private StringRedisTemplate   redisTemplate;
+    @Autowired private MeterRegistry         meterRegistry;
 
     @BeforeEach
     void setUp() {
-        inventoryRepository.deleteAll();
-        // flush Redis between tests: stale keys from prior runs would defeat the assertions
-        redisTemplate.getConnectionFactory().getConnection().serverCommands().flushAll();
+        inventoryRepository.findByTicketTypeId(TICKET_TYPE_ID).ifPresent(inventoryRepository::delete);
+        redisTemplate.delete(REDIS_KEY);
+    }
+
+    @AfterEach
+    void tearDown() {
+        inventoryRepository.findByTicketTypeId(TICKET_TYPE_ID).ifPresent(inventoryRepository::delete);
+        redisTemplate.delete(REDIS_KEY);
     }
 
     @Test
-    void cache_hit_returns_stock_from_redis() {
+    void cache_hit_returns_stock_from_redis_with_cache_source() {
         inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
-        // wait for CDC to propagate the INSERT before asserting on cache
+        // Must wait for CDC before asserting a cache hit; a premature read would be a miss.
         awaitRedisStock(INITIAL_STOCK);
 
         double hitsBefore = counterValue("ticketflow_inventory_query_cache_hits_total");
-
-        StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
+        StockView result  = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
         assertThat(result.ticketTypeId()).isEqualTo(TICKET_TYPE_ID);
         assertThat(result.availableStock()).isEqualTo(INITIAL_STOCK);
         assertThat(result.source()).isEqualTo(StockView.StockSource.CACHE);
-
-        // >= because MeterRegistry is shared across the suite and other tests may
-        // also drive cache hits before this one runs
+        // >= because MeterRegistry is suite-scoped; other tests may also drive cache hits
         assertThat(counterValue("ticketflow_inventory_query_cache_hits_total"))
-                .as("cache hit counter must increment for the hit we just executed")
                 .isGreaterThanOrEqualTo(hitsBefore + 1);
     }
 
     @Test
-    void cache_miss_falls_through_to_database() {
-        // delete the key to simulate CDC lag or maxmemory eviction
+    void cache_miss_falls_through_to_database_when_redis_key_absent() {
         inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
         awaitRedisStock(INITIAL_STOCK);
-        redisTemplate.delete("inventory:" + TICKET_TYPE_ID);
+        redisTemplate.delete(REDIS_KEY); // simulate CDC lag or key eviction
 
         double missesBefore = counterValue("ticketflow_inventory_query_cache_misses_total");
-
-        StockView result = inventoryQueryService.getStock(TICKET_TYPE_ID);
+        StockView result    = inventoryQueryService.getStock(TICKET_TYPE_ID);
 
         assertThat(result.availableStock()).isEqualTo(INITIAL_STOCK);
         assertThat(result.source()).isEqualTo(StockView.StockSource.DATABASE);
-
         assertThat(counterValue("ticketflow_inventory_query_cache_misses_total"))
-                .as("cache miss counter must increment when Redis returned null")
                 .isGreaterThanOrEqualTo(missesBefore + 1);
     }
 
     @Test
     void unknown_ticket_type_throws_inventory_not_found() {
-        // >= not == : MeterRegistry is suite-scoped, other tests may have already incremented this counter
-        assertThatThrownBy(() -> inventoryQueryService.getStock(99999L))
+        assertThatThrownBy(() -> inventoryQueryService.getStock(NON_EXISTENT_TICKET_TYPE))
                 .isInstanceOf(DomainException.class)
                 .extracting(e -> ((DomainException) e).getResultCode())
                 .isEqualTo(ResultCode.INVENTORY_NOT_FOUND);
     }
 
     @Test
-    void cache_reflects_db_writes_via_cdc() {
+    void write_path_change_propagates_to_redis_via_cdc() {
         inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
         awaitRedisStock(INITIAL_STOCK);
 
-        StockView before = inventoryQueryService.getStock(TICKET_TYPE_ID);
-        assertThat(before.availableStock()).isEqualTo(INITIAL_STOCK);
-        assertThat(before.source()).isEqualTo(StockView.StockSource.CACHE);
-
-        // Drive a write through the production write path; CDC should mirror it to Redis
-        inventoryService.dbDeduct(TICKET_TYPE_ID, 30);
-        awaitRedisStock(INITIAL_STOCK - 30);
+        inventoryService.dbDeduct(TICKET_TYPE_ID, DEDUCT_QTY);
+        awaitRedisStock(INITIAL_STOCK - DEDUCT_QTY);
 
         StockView after = inventoryQueryService.getStock(TICKET_TYPE_ID);
-        assertThat(after.availableStock()).isEqualTo(INITIAL_STOCK - 30);
-        assertThat(after.source())
-                .as("after CDC propagation, the read should still be served from cache")
-                .isEqualTo(StockView.StockSource.CACHE);
+        assertThat(after.availableStock()).isEqualTo(INITIAL_STOCK - DEDUCT_QTY);
+        assertThat(after.source()).isEqualTo(StockView.StockSource.CACHE);
+    }
+
+    @Test
+    void cdc_propagation_reflects_stock_conservation_invariant() {
+        inventoryService.initStock(TICKET_TYPE_ID, INITIAL_STOCK);
+        awaitRedisStock(INITIAL_STOCK);
+
+        inventoryService.dbDeduct(TICKET_TYPE_ID, RELEASE_TEST_QTY);
+        awaitRedisStock(INITIAL_STOCK - RELEASE_TEST_QTY);
+
+        inventoryService.releaseStock(TICKET_TYPE_ID, RELEASE_TEST_QTY);
+        awaitRedisStock(INITIAL_STOCK);
+
+        assertThat(inventoryQueryService.getStock(TICKET_TYPE_ID).availableStock())
+                .isEqualTo(INITIAL_STOCK);
     }
 
     private double counterValue(String name) {
@@ -122,8 +131,7 @@ class InventoryQueryServiceTest extends IntegrationTestBase {
     }
 
     private void awaitRedisStock(int expected) {
-        await().atMost(CDC_TIMEOUT)
-                .pollInterval(POLL_INTERVAL)
+        await().atMost(CDC_TIMEOUT).pollInterval(POLL_INTERVAL)
                 .until(() -> {
                     Integer actual = redisInventoryManager.getStock(TICKET_TYPE_ID);
                     return actual != null && actual == expected;

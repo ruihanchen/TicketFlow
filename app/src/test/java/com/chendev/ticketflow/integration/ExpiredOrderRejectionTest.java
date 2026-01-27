@@ -26,8 +26,9 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-// Two-tier expiry: cart deadline guards payOrder; payment deadline guards confirmPayment.
-// Splits the old single-deadline model that rejected in-flight payments confirmed past expiredAt.
+// Two-tier expiry: cart deadline (expiredAt) guards payOrder(); payment deadline (paymentExpiredAt)
+// guards confirmPayment(). The two fields are independent, the V4 bug used expiredAt for both,
+// rejecting in-flight payments where the gateway confirmation arrived slightly after the cart deadline.
 class ExpiredOrderRejectionTest extends IntegrationTestBase {
 
     @Autowired private OrderService         orderService;
@@ -45,14 +46,14 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
 
     @BeforeEach
     void setUp() {
+        // Deletion order respects FK constraints: orders -> ticket_types -> events
         orderRepository.deleteAll();
         inventoryRepository.deleteAll();
         ticketTypeRepository.deleteAll();
         eventRepository.deleteAll();
 
         Instant now = Instant.now();
-        Event event = Event.create(
-                "Expiry Test Event", "desc", "venue",
+        Event event = Event.create("Expiry Test Event", "desc", "venue",
                 now.plus(30, ChronoUnit.DAYS),
                 now.minus(1, ChronoUnit.DAYS),
                 now.plus(1, ChronoUnit.DAYS));
@@ -77,12 +78,26 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
 
         Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(OrderStatus.CREATED);
+        assertThat(reloaded.getPaymentExpiredAt()).isNull();
     }
 
     @Test
-    void payment_expired_order_cannot_confirm_payment() {
+    void cart_expired_order_rejects_payment_without_deducting_stock() {
+        String orderNo = createAndExpireCart();
+        int stockAfterCreate = availableStock();
+
+        assertThatThrownBy(() -> orderService.payOrder(USER_ID, orderNo))
+                .isInstanceOf(DomainException.class);
+
+        // payOrder() rejection is a no-op (only cancellation restores stock)
+        assertThat(availableStock()).isEqualTo(stockAfterCreate);
+    }
+
+    @Test
+    void payment_expired_order_cannot_confirm() {
         String orderNo = createOrder();
         orderService.payOrder(USER_ID, orderNo);
+
         Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
         order.expirePaymentNow();
         orderRepository.save(order);
@@ -92,41 +107,60 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
                 .extracting(e -> ((DomainException) e).getResultCode())
                 .isEqualTo(ResultCode.ORDER_EXPIRED);
 
-        Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        assertThat(reloaded.getStatus()).isEqualTo(OrderStatus.PAYING);
+        assertThat(orderRepository.findByOrderNo(orderNo).orElseThrow().getStatus())
+                .isEqualTo(OrderStatus.PAYING);
+    }
+
+    @Test
+    void payment_expired_rejection_does_not_restore_stock() {
+        // Confirm failure leaves the order PAYING; stock stays held until explicit cancellation.
+        String orderNo = createOrder();
+        orderService.payOrder(USER_ID, orderNo);
+        orderRepository.findByOrderNo(orderNo).ifPresent(o -> {
+            o.expirePaymentNow();
+            orderRepository.save(o);
+        });
+
+        int stockBefore = availableStock();
+        assertThatThrownBy(() -> orderService.confirmPayment(USER_ID, orderNo))
+                .isInstanceOf(DomainException.class);
+
+        assertThat(availableStock()).isEqualTo(stockBefore);
     }
 
     @Test
     void in_flight_payment_succeeds_even_when_cart_deadline_passed() {
-        // cart deadline passed during gateway round-trip; payment must still go through
+        // Core V4 invariant: confirmPayment() checks paymentExpiredAt, not expiredAt.
+        // User clicks Pay just before cart deadline; gateway round-trip pushes confirm past expiredAt.
         String orderNo = createOrder();
         orderService.payOrder(USER_ID, orderNo);
+
+        // Cart deadline passes; paymentExpiredAt remains in the future
         Order order = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        order.expireNow();  // expires cart; paymentExpiredAt remains in the future
+        order.expireNow();
         orderRepository.save(order);
+
         orderService.confirmPayment(USER_ID, orderNo);
 
-        Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        assertThat(reloaded.getStatus())
-                .as("in-flight payment within payment window must finalize regardless of cart deadline")
+        assertThat(orderRepository.findByOrderNo(orderNo).orElseThrow().getStatus())
                 .isEqualTo(OrderStatus.PAID);
     }
 
     @Test
-    void unexpired_order_can_pay_normally() {
+    void happy_path_unexpired_order_reaches_paid() {
         String orderNo = createOrder();
-
         orderService.payOrder(USER_ID, orderNo);
         orderService.confirmPayment(USER_ID, orderNo);
 
-        Order reloaded = orderRepository.findByOrderNo(orderNo).orElseThrow();
-        assertThat(reloaded.getStatus()).isEqualTo(OrderStatus.PAID);
+        assertThat(orderRepository.findByOrderNo(orderNo).orElseThrow().getStatus())
+                .isEqualTo(OrderStatus.PAID);
+        assertThat(availableStock()).isEqualTo(INITIAL_STOCK - 1);
     }
 
     private String createOrder() {
-        var response = orderService.createOrder(USER_ID,
-                CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()));
-        return response.getOrderNo();
+        return orderService.createOrder(USER_ID,
+                        CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()))
+                .getOrderNo();
     }
 
     private String createAndExpireCart() {
@@ -135,5 +169,9 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
         order.expireNow();
         orderRepository.save(order);
         return orderNo;
+    }
+
+    private int availableStock() {
+        return inventoryRepository.findByTicketTypeId(ticketTypeId).orElseThrow().getAvailableStock();
     }
 }
