@@ -29,6 +29,8 @@ public class Inventory {
     @Version
     private Integer version;
 
+    // NOT NULL in V1 schema; native queries must set this explicitly
+    @Column(nullable = false)
     private Instant updatedAt;
 
     @PreUpdate

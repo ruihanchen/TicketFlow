@@ -5,13 +5,12 @@ public enum OrderEvent {
 
     PAYMENT_SUCCESS,
 
+    // reserved for payment gateway webhook
     PAYMENT_FAIL,
 
     PAYMENT_TIMEOUT,
 
     CANCEL_BY_USER,
 
-    SYSTEM_TIMEOUT,
-
-    CONFIRM
+    SYSTEM_TIMEOUT
 }

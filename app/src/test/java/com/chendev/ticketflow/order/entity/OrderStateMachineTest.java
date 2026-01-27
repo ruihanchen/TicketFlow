@@ -55,15 +55,6 @@ class OrderStateMachineTest {
     }
 
     @Test
-    void paid_to_confirmed() {
-        Order order = createTestOrder();
-        order.transitionTo(OrderStatus.PAYING, OrderEvent.INITIATE_PAYMENT, "pay");
-        order.transitionTo(OrderStatus.PAID, OrderEvent.PAYMENT_SUCCESS, "paid");
-        order.transitionTo(OrderStatus.CONFIRMED, OrderEvent.CONFIRM, "done");
-        assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
-    }
-
-    @Test
     void history_entry_records_correct_from_to_and_event() {
         // transitionTo() must record fromStatus BEFORE updating this.status.
         // If the order is wrong, fromStatus will equal the new status.
@@ -155,20 +146,19 @@ class OrderStateMachineTest {
 
     static Stream<Arguments> invalidTransitions() {
         return Stream.of(
+                //can't skip PAYING
                 Arguments.of(OrderStatus.CREATED,   OrderStatus.PAID),
-                Arguments.of(OrderStatus.CREATED,   OrderStatus.CONFIRMED),
+
+                //can't go backwards
                 Arguments.of(OrderStatus.PAYING,    OrderStatus.CREATED),
                 Arguments.of(OrderStatus.PAID,      OrderStatus.PAYING),
                 Arguments.of(OrderStatus.PAID,      OrderStatus.CREATED),
+
+                //terminal states: no way out
                 Arguments.of(OrderStatus.PAID,      OrderStatus.CANCELLED),
-                Arguments.of(OrderStatus.CONFIRMED, OrderStatus.CANCELLED),
-                Arguments.of(OrderStatus.CONFIRMED, OrderStatus.CREATED),
-                Arguments.of(OrderStatus.CONFIRMED, OrderStatus.PAYING),
-                Arguments.of(OrderStatus.CONFIRMED, OrderStatus.PAID),
                 Arguments.of(OrderStatus.CANCELLED, OrderStatus.CREATED),
                 Arguments.of(OrderStatus.CANCELLED, OrderStatus.PAYING),
-                Arguments.of(OrderStatus.CANCELLED, OrderStatus.PAID),
-                Arguments.of(OrderStatus.CANCELLED, OrderStatus.CONFIRMED)
+                Arguments.of(OrderStatus.CANCELLED, OrderStatus.PAID)
         );
     }
 
@@ -199,7 +189,5 @@ class OrderStateMachineTest {
         order.transitionTo(OrderStatus.PAYING, OrderEvent.INITIATE_PAYMENT, "setup");
         if (target == OrderStatus.PAYING) return;
         order.transitionTo(OrderStatus.PAID, OrderEvent.PAYMENT_SUCCESS, "setup");
-        if (target == OrderStatus.PAID) return;
-        order.transitionTo(OrderStatus.CONFIRMED, OrderEvent.CONFIRM, "setup");
     }
 }

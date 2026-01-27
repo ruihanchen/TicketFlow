@@ -32,10 +32,8 @@ public class Order {
                 EnumSet.of(OrderStatus.PAYING, OrderStatus.CANCELLED));
         TRANSITIONS.put(OrderStatus.PAYING,
                 EnumSet.of(OrderStatus.PAID, OrderStatus.CANCELLED));
-        TRANSITIONS.put(OrderStatus.PAID,
-                EnumSet.of(OrderStatus.CONFIRMED));
-        //terminal states(no transitions out)
-        TRANSITIONS.put(OrderStatus.CONFIRMED, EnumSet.noneOf(OrderStatus.class));
+        // terminal states: no transitions out
+        TRANSITIONS.put(OrderStatus.PAID, EnumSet.noneOf(OrderStatus.class));
         TRANSITIONS.put(OrderStatus.CANCELLED, EnumSet.noneOf(OrderStatus.class));
     }
 
