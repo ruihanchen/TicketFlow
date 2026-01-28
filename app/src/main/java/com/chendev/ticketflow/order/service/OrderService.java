@@ -6,6 +6,7 @@ import com.chendev.ticketflow.order.dto.CreateOrderRequest;
 import com.chendev.ticketflow.order.dto.OrderResponse;
 import com.chendev.ticketflow.order.entity.Order;
 import com.chendev.ticketflow.order.factory.OrderNoFactory;
+import com.chendev.ticketflow.order.metrics.OrderMetrics;
 import com.chendev.ticketflow.inventory.port.DeductionResult;
 import com.chendev.ticketflow.order.port.EventPort;
 import com.chendev.ticketflow.order.port.InventoryPort;
@@ -36,6 +37,7 @@ public class OrderService {
     private final InventoryPort   inventoryPort;
     private final EventPort       eventPort;
     private final OrderNoFactory  orderNoFactory;
+    private final OrderMetrics    orderMetrics;
 
     //cart hold window: how long a CREATED order survives before the reaper releases it
     @Value("${ticketflow.order.cart-window-minutes:15}")
@@ -50,6 +52,7 @@ public class OrderService {
         //fast path: catch sequential duplicates without hitting a constraint.
         if (orderRepository.existsByRequestId(req.getRequestId())) {
             log.info("[Order] duplicate request: requestId={}", req.getRequestId());
+            orderMetrics.recordDuplicate();
             return new OrderResponse(
                     orderRepository.findByRequestId(req.getRequestId())
                             .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND)));
@@ -77,15 +80,16 @@ public class OrderService {
             orderRepository.save(order);
             orderRepository.flush();
         } catch (DataIntegrityViolationException e) {
-            // UUIDv7 makes orderNo collisions impossible; this can only be a duplicate requestId from a concurrent
-            // insert that slipped past the existsByRequestId fast-path above. TX rollback already undoes
-            // the inventory deduction
+            // UUIDv7 makes orderNo collisions impossible; only requestId can reach here (TOCTOU).
+            // TX rollback undoes the deduction. Counted separately from the fast-path duplicate check.
+            orderMetrics.recordDuplicate();
             throw DomainException.of(ResultCode.DUPLICATE_REQUEST,
                     "duplicate requestId after concurrent insert", e);
         }
 
         log.info("[Order] created: orderNo={}, userId={}, ticketTypeId={}",
                 order.getOrderNo(), userId, req.getTicketTypeId());
+        orderMetrics.recordCreated();
 
         return new OrderResponse(order);
     }

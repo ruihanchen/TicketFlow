@@ -22,8 +22,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-// Derives DB connection from HikariDataSource so test profile overrides (spring.datasource.url) apply automatically,
-// no separate Debezium config file needed.
+// Embedded Debezium engine watching public.inventories.Derives DB connection from Spring DataSource
+// so test profile overrides apply automatically.
 @Slf4j
 @Configuration
 @RequiredArgsConstructor
@@ -62,6 +62,10 @@ public class DebeziumEngineLifecycle {
     private ExecutorService executor;
     private DebeziumEngine<ChangeEvent<String, String>> engine;
 
+    // ExecutorService stays alive even after the engine thread exits, so we need a separate flag.
+    // CompletionCallback sets this to false on both clean shutdown and internal failure.
+    private volatile boolean engineRunning = false;
+
     @PostConstruct
     public void start() throws IOException {
         ensureParentDirectoryExists(offsetStorageFile);
@@ -71,17 +75,31 @@ public class DebeziumEngineLifecycle {
 
         engine = DebeziumEngine.create(Json.class)
                 .using(props)
+                .using((success, message, error) -> {
+                    engineRunning = false;
+                    if (error != null) {
+                        log.error("[Debezium] Engine terminated with error: {}", message, error);
+                    } else {
+                        log.warn("[Debezium] Engine stopped: success={}, message={}", success, message);
+                    }
+                })
                 .notifying(inventoryChangeHandler)
                 .build();
 
         executor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "debezium-engine");
-            t.setDaemon(true);
+            t.setDaemon(true); // don't block JVM shutdown if the engine thread is still running
             return t;
         });
         executor.execute(engine);
+        engineRunning = true;
 
         log.info("[Debezium] Engine started for connector: {}", connectorName);
+    }
+
+    // checks both: volatile flag (engine thread exits) + executor state (PreDestroy shutdown)
+    public boolean isEngineRunning() {
+        return engineRunning && executor != null && !executor.isShutdown();
     }
 
     @PreDestroy
