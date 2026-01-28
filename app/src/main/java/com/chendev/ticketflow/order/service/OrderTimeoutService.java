@@ -60,11 +60,12 @@ public class OrderTimeoutService {
                 totalCancelled++;
                 cancelledCounter.increment();
             } catch (Exception e) {
-                // per-order isolation: one failure doesn't stop the loop.
-                // with SKIP LOCKED + per-order TX, an exception here means a real problem, not a lock race.
+                // real fault, not a lock race (SKIP LOCKED means contention never throws here).
+                // break to avoid hot loop, this order stays CREATED after rollback and would be re-selected.
                 failures++;
                 failureCounter.increment();
                 log.error("[Timeout] failed to process expired order: {}", e.getMessage());
+                break; // same broken order would be re-selected on the next iteration (still CREATED after rollback)
             }
         }
 

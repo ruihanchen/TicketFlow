@@ -13,6 +13,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.dao.DataIntegrityViolationException;
 
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
@@ -96,6 +97,15 @@ public class GlobalExceptionHandler {
                 e.getName(), requiredType);
         log.warn("[BadRequest] type mismatch: {}", detail);
         return Result.fail(ResultCode.BAD_REQUEST, detail);
+    }
+
+    // Order @Version conflict: two concurrent requests modify the same order(user double-clicks pay,
+    // or cancelOrder races with the reaper). Not a server error; the first request won, this one lost.
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public Result<?> handleOptimisticLock(ObjectOptimisticLockingFailureException e) {
+        log.warn("[OptimisticLock] {}", e.getMessage());
+        return Result.fail(ResultCode.CONFLICT, "concurrent modification, please retry");
     }
 
     @ExceptionHandler(Exception.class)

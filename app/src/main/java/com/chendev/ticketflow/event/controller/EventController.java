@@ -14,6 +14,7 @@ import org.springframework.http.HttpStatus;
 import com.chendev.ticketflow.common.response.Result;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
 
 
 
@@ -37,8 +38,9 @@ public class EventController {
     }
 
     //only returns PUBLISHED events;see EventService.listPublished()
+    //stable sort prevents duplicate/missing rows across pages when Postgres row order shifts
     @GetMapping
-    public Result<Page<EventResponse>> list(Pageable pageable) {
+    public Result<Page<EventResponse>> list(@PageableDefault(sort = "id") Pageable pageable) {
         return Result.ok(eventService.listPublished(pageable));
     }
 

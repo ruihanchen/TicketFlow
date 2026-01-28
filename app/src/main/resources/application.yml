@@ -8,7 +8,7 @@ spring:
     password: ${DB_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver
     hikari:
-      maximum-pool-size: ${DB_POOL_SIZE:10}
+      maximum-pool-size: ${DB_POOL_SIZE:50}
       minimum-idle: 2
       connection-timeout: 30000
       #logs a warning if a connection is held > 5s
@@ -23,6 +23,13 @@ spring:
       timeout: 500ms
       lettuce:
         shutdown-timeout: 600ms # > command timeout (500ms) so in-flight commands finish; << 30s shutdown budget
+    web:
+      pageable:
+        max-page-size: 50
+        default-page-size: 20
+
+  transaction:
+    default-timeout: 10 # seconds; prevents runaway queries from holding connections indefinitely
 
   jpa:
     hibernate:
@@ -117,5 +124,5 @@ ticketflow:
 
 logging:
   level:
-    com.chendev.ticketflow: DEBUG
+    com.chendev.ticketflow: INFO
     org.springframework.security: INFO

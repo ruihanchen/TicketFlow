@@ -49,15 +49,17 @@ public class OrderService {
 
     @Transactional
     public OrderResponse createOrder(Long userId, CreateOrderRequest req) {
-        //fast path: catch sequential duplicates without hitting a constraint.
-        if (orderRepository.existsByRequestId(req.getRequestId())) {
-            log.info("[Order] duplicate request: requestId={}", req.getRequestId());
-            orderMetrics.recordDuplicate();
-            return new OrderResponse(
-                    orderRepository.findByRequestId(req.getRequestId())
-                            .orElseThrow(() -> DomainException.of(ResultCode.ORDER_NOT_FOUND)));
-        }
+        // single query replaces existsByRequestId + findByRequestId double-hit
+        return orderRepository.findByRequestId(req.getRequestId())
+                .map(existing -> {
+                    log.info("[Order] duplicate request: requestId={}", req.getRequestId());
+                    orderMetrics.recordDuplicate();
+                    return new OrderResponse(existing);
+                })
+                .orElseGet(() -> doCreateOrder(userId, req));
+    }
 
+    private OrderResponse doCreateOrder(Long userId, CreateOrderRequest req) {
         TicketTypeInfo ticketTypeInfo = eventPort.getTicketTypeInfo(req.getTicketTypeId());
 
         if (!ticketTypeInfo.onSale()) {
@@ -80,8 +82,8 @@ public class OrderService {
             orderRepository.save(order);
             orderRepository.flush();
         } catch (DataIntegrityViolationException e) {
-            // UUIDv7 makes orderNo collisions impossible; only requestId can reach here (TOCTOU).
-            // TX rollback undoes the deduction. Counted separately from the fast-path duplicate check.
+            // UUIDv7 makes orderNo collisions impossible; only requestId TOCTOU reaches here.
+            // TX rollback undoes the deduction.
             orderMetrics.recordDuplicate();
             throw DomainException.of(ResultCode.DUPLICATE_REQUEST,
                     "duplicate requestId after concurrent insert", e);
