@@ -9,7 +9,7 @@ import com.chendev.ticketflow.event.repository.EventRepository;
 import com.chendev.ticketflow.event.repository.TicketTypeRepository;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.inventory.service.InventoryService;
-import com.chendev.ticketflow.order.dto.CreateOrderRequest;
+import com.chendev.ticketflow.OrderTestFactory;
 import com.chendev.ticketflow.order.dto.OrderResponse;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.service.OrderService;
@@ -78,9 +78,9 @@ class IdempotencyTest extends IntegrationTestBase {
     @Test
     void same_requestId_sequential_returns_same_orderNo_and_creates_one_row() {
         OrderResponse first  = orderService.createOrder(USER_ID,
-                CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
+                OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
         OrderResponse second = orderService.createOrder(USER_ID,
-                CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
+                OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
 
         assertThat(second.getOrderNo()).isEqualTo(first.getOrderNo());
         assertThat(orderRepository.count()).isEqualTo(1);
@@ -88,11 +88,11 @@ class IdempotencyTest extends IntegrationTestBase {
 
     @Test
     void sequential_replay_does_not_deduct_stock_twice() {
-        orderService.createOrder(USER_ID, CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
+        orderService.createOrder(USER_ID, OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
         int stockAfterFirst = availableStock();
 
         // existsByRequestId returns true on replay; early return, no inventory call
-        orderService.createOrder(USER_ID, CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
+        orderService.createOrder(USER_ID, OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
 
         assertThat(availableStock()).isEqualTo(stockAfterFirst);
     }
@@ -114,7 +114,7 @@ class IdempotencyTest extends IntegrationTestBase {
                 try {
                     start.await();
                     orderService.createOrder(USER_ID,
-                            CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
+                            OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
                     success.incrementAndGet();
                 } catch (DomainException e) {
                     if (e.getResultCode() == ResultCode.DUPLICATE_REQUEST) {
@@ -148,8 +148,8 @@ class IdempotencyTest extends IntegrationTestBase {
     @Test
     void different_requestIds_create_independent_orders() {
         String requestId2 = UUID.randomUUID().toString();
-        orderService.createOrder(USER_ID, CreateOrderRequest.forTest(ticketTypeId, 1, requestId));
-        orderService.createOrder(USER_ID, CreateOrderRequest.forTest(ticketTypeId, 1, requestId2));
+        orderService.createOrder(USER_ID, OrderTestFactory.createRequest(ticketTypeId, 1, requestId));
+        orderService.createOrder(USER_ID, OrderTestFactory.createRequest(ticketTypeId, 1, requestId2));
 
         assertThat(orderRepository.count()).isEqualTo(2);
         assertThat(availableStock()).isEqualTo(INITIAL_STOCK - 2);

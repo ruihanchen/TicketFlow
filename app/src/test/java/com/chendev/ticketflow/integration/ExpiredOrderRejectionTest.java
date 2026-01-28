@@ -9,7 +9,7 @@ import com.chendev.ticketflow.event.repository.EventRepository;
 import com.chendev.ticketflow.event.repository.TicketTypeRepository;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.inventory.service.InventoryService;
-import com.chendev.ticketflow.order.dto.CreateOrderRequest;
+import com.chendev.ticketflow.OrderTestFactory;
 import com.chendev.ticketflow.order.entity.Order;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.service.OrderService;
@@ -159,7 +159,7 @@ class ExpiredOrderRejectionTest extends IntegrationTestBase {
 
     private String createOrder() {
         return orderService.createOrder(USER_ID,
-                        CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()))
+                        OrderTestFactory.createRequest(ticketTypeId, 1, UUID.randomUUID().toString()))
                 .getOrderNo();
     }
 

@@ -5,7 +5,8 @@ public enum OrderEvent {
 
     PAYMENT_SUCCESS,
 
-    // reserved for payment gateway webhook
+    // transition target (PAYING→CANCELLED) already works via CANCEL_BY_USER;
+    // this label reserved for Stripe webhook to distinguish user-cancel from gateway-reject
     PAYMENT_FAIL,
 
     PAYMENT_TIMEOUT,

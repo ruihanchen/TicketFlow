@@ -27,7 +27,6 @@ public enum ResultCode {
     // inventory
     INSUFFICIENT_STOCK(2001, "insufficient stock", 409),
     INVENTORY_NOT_FOUND(2002, "inventory not found", 404),
-    INVENTORY_LOCK_FAILED(2003, "high demand, please retry", 503),
 
     // event
     EVENT_NOT_FOUND(3001, "event not found", 404),
