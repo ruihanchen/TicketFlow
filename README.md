@@ -1,5 +1,7 @@
 # TicketFlow
 
+[![CI](https://github.com/ruihanchen/TicketFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/ruihanchen/TicketFlow/actions/workflows/ci.yml)
+
 Backend for a flash-sale ticket system. The whole design is basically my answer to the 2022 Ticketmaster Taylor Swift meltdown. 14 million people tried to buy tickets at once and the site fell over. Not because 14 million purchase attempts overloaded the DB, but because every "are tickets still available?" check ran through the same code path as an actual purchase. There was nowhere cheap to send people who just wanted to find out tickets were gone.
 
 TicketFlow splits the two paths. Stock queries hit Redis, which gets populated by CDC off the Postgres WAL (around 5ms per response). Orders go straight to Postgres through a conditional UPDATE that won't let you sell stock that isn't there. Once stock hits zero, Redis shows zero, and most clients stop trying to order. A few still sneak through during the sub-second CDC lag window, and the write path rejects those cleanly with a 409.
