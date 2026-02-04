@@ -2,7 +2,6 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    # attached to every time series; useful when federating multiple Prometheus instances
     cluster: ticketflow-local
     environment: dev
 
@@ -11,8 +10,7 @@ scrape_configs:
     metrics_path: /actuator/prometheus
     static_configs:
       - targets:
-          # Spring Boot runs on the host, not in Docker; host.docker.internal resolves to the host IP
-          - host.docker.internal:8080
+          - app:8080
         labels:
           service: ticketflow
           instance: app-1

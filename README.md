@@ -147,9 +147,24 @@ app/src/main/java/com/chendev/ticketflow/
 
 ## Running Locally
 
+**One command** (requires Docker):
+
 ```bash
 docker compose up -d
+```
+
+This builds the app from source, starts Postgres, Redis, Prometheus, and Grafana. First run takes a few minutes to download Maven dependencies; subsequent builds use the Docker cache. The app is at `localhost:8080`, Grafana at `localhost:3000`.
+
+**For development** (run app on host, faster reload):
+
+```bash
+docker compose up -d postgres redis    # infrastructure only
 ./mvnw spring-boot:run -pl app
+```
+
+Tests (Testcontainers; does not need `docker compose`):
+
+```bash
 ./mvnw test -pl app
 ```
 
