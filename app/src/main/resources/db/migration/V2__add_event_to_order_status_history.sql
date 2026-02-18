@@ -1,0 +1,1 @@
+ALTER TABLE order_status_history ADD COLUMN event VARCHAR(50);
