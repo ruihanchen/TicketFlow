@@ -1,0 +1,11 @@
+spring:
+  flyway:
+    enabled: true
+  jpa:
+    show-sql: false
+    hibernate:
+      ddl-auto: validate
+
+ticketflow:
+  timeout:
+    fixed-delay: 3600000
