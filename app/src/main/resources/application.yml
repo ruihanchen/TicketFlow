@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: ticketflow-app
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ticketflow
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+#        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+    open-in-view: false
+
+  jackson:
+    default-property-inclusion: non_null
+    time-zone: UTC
+
+server:
+  port: 8080
+
+jwt:
+  secret: ${JWT_SECRET:local-dev-secret-key-change-in-production-min-32-chars}
+  expiration-ms: 86400000
+
+logging:
+  level:
+    com.chendev.ticketflow: DEBUG
+    org.springframework.security: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level [%logger{36}] - %msg%n"
