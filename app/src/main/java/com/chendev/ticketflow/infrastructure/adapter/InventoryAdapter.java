@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Propagation;
 
 @Slf4j
 @Component
@@ -19,19 +20,27 @@ public class InventoryAdapter implements InventoryPort {
 
     private final InventoryRepository inventoryRepository;
 
+    // noRollbackFor = BizException.class:
+    // When OptimisticLockingFailureException is caught and re-thrown as BizException,
+    // we do NOT want Spring to mark the shared transaction as rollback-only.
+    // BizException is a handled business condition, not an unrecoverable error.
+    // Without this, the outer createOrder() transaction would be poisoned before
+    // its catch blocks have a chance to execute recovery logic.
     @Override
-    @Transactional
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void deductStock(Long ticketTypeId, int quantity) {
         Inventory inventory = findInventory(ticketTypeId);
         try {
             inventory.deduct(quantity);
             inventoryRepository.save(inventory);
-            inventoryRepository.flush();
+            inventoryRepository.flush(); // Force immediate SQL execution so that
+            // OptimisticLockException surfaces here,
+            // inside this try-catch, not at commit time.
             log.info("[Inventory] Deducted: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
         } catch (OptimisticLockingFailureException e) {
-            // Another transaction updated inventory concurrently
-            // In MVP this surfaces as a failure — Phase 2 adds retry logic
+            // Another transaction updated inventory concurrently.
+            // Surface this as a retryable business exception, not a system error.
             log.warn("[Inventory] Optimistic lock conflict: ticketTypeId={}", ticketTypeId);
             throw BizException.of(ResultCode.INVENTORY_LOCK_FAILED,
                     "High demand — please try again");
@@ -45,26 +54,24 @@ public class InventoryAdapter implements InventoryPort {
         try {
             inventory.release(quantity);
             inventoryRepository.save(inventory);
-            log.info("[Inventory] Released: ticketTypeId={}, quantity={}, available={}",
+            log.info("[Inventory] Released: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
         } catch (OptimisticLockingFailureException e) {
-            // Release failure is a system-level concern — should not fail silently
-            throw new SystemException(ResultCode.INTERNAL_ERROR,
-                    "Failed to release inventory for ticketTypeId=" + ticketTypeId, e);
+            log.warn("[Inventory] Optimistic lock conflict on release: ticketTypeId={}", ticketTypeId);
+            throw BizException.of(ResultCode.INVENTORY_LOCK_FAILED,
+                    "Failed to release stock — please retry");
         }
     }
 
     @Override
     @Transactional(readOnly = true)
     public boolean hasSufficientStock(Long ticketTypeId, int quantity) {
-        return inventoryRepository.findByTicketTypeId(ticketTypeId)
-                .map(inv -> inv.hasSufficientStock(quantity))
-                .orElse(false);
+        return findInventory(ticketTypeId).getAvailableStock() >= quantity;
     }
 
     private Inventory findInventory(Long ticketTypeId) {
         return inventoryRepository.findByTicketTypeId(ticketTypeId)
                 .orElseThrow(() -> new SystemException(ResultCode.INTERNAL_ERROR,
-                        "Inventory record missing for ticketTypeId=" + ticketTypeId));
+                        "Inventory record not found for ticketTypeId: " + ticketTypeId));
     }
 }

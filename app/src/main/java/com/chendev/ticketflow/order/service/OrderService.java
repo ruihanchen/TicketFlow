@@ -1,6 +1,7 @@
 package com.chendev.ticketflow.order.service;
 
 import com.chendev.ticketflow.common.exception.BizException;
+import com.chendev.ticketflow.common.exception.SystemException;
 import com.chendev.ticketflow.common.response.PageResult;
 import com.chendev.ticketflow.common.response.ResultCode;
 import com.chendev.ticketflow.event.entity.TicketType;
@@ -13,14 +14,13 @@ import com.chendev.ticketflow.order.port.InventoryPort;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.statemachine.OrderEvent;
 import com.chendev.ticketflow.order.statemachine.OrderStateMachine;
-import com.chendev.ticketflow.order.statemachine.OrderStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
 import java.util.UUID;
 
 @Slf4j
@@ -34,64 +34,116 @@ public class OrderService {
     private final InventoryPort inventoryPort;
     private final OrderStateMachine orderStateMachine;
 
-    @Transactional
+    // noRollbackFor = BizException.class:
+    // BizException represents a handled business condition (lock conflict, duplicate
+    // request). Without this, Spring marks the transaction rollback-only when
+    // BizException escapes from InventoryAdapter.deductStock(), preventing our
+    // catch blocks from executing idempotency recovery logic.
+    @Transactional(noRollbackFor = BizException.class)
     public OrderResponse createOrder(Long userId, CreateOrderRequest request) {
+        try {
+            return doCreateOrder(userId, request);
+        } catch (DataIntegrityViolationException e) {
+            // The DB UNIQUE constraint on request_id caught a concurrent duplicate.
+            // The Hibernate session is now corrupted — do NOT query it.
+            // Signal idempotency rejection cleanly so the caller can handle it.
+            log.info("[Order] Idempotency enforced by DB constraint: requestId={}",
+                    request.getRequestId());
+            throw BizException.of(ResultCode.IDEMPOTENT_REJECTION,
+                    "Duplicate request detected — order already exists");
+        } catch (BizException e) {
+            if (e.getCode() == ResultCode.INVENTORY_LOCK_FAILED.getCode()) {
+                // Concurrent requests with the same requestId all passed the idempotency
+                // check, then raced at inventory deduction. The winner created the order;
+                // these are the losers. Check if the order now exists — if so, return it.
+                return orderRepository.findByRequestId(request.getRequestId())
+                        .map(order -> {
+                            log.info("[Order] Idempotency resolved after lock conflict: " +
+                                    "requestId={}", request.getRequestId());
+                            return OrderResponse.from(order);
+                        })
+                        .orElseThrow(() -> e); // Genuine lock conflict, not idempotency
+            }
+            throw e;
+        }
+    }
 
-        // ── Step 1: Idempotency check ─────────────────────────────────────────
-        // Same requestId = duplicate request, return existing order immediately
+    private OrderResponse doCreateOrder(Long userId, CreateOrderRequest request) {
+
+        // ── Step 1: Idempotency check (fast path) ────────────────────────────
+        // Handles the sequential retry case: if a previous request already committed,
+        // return that order immediately. The DB UNIQUE constraint + noRollbackFor
+        // handle the concurrent case in the outer method.
         if (orderRepository.existsByRequestId(request.getRequestId())) {
             log.info("[Order] Duplicate requestId detected: {}", request.getRequestId());
             return orderRepository.findByRequestId(request.getRequestId())
                     .map(OrderResponse::from)
-                    .orElseThrow(() -> BizException.of(ResultCode.ORDER_NOT_FOUND));
+                    .orElseThrow(() -> BizException.of(ResultCode.ORDER_CREATE_FAILED,
+                            "Idempotency key exists but order not found"));
         }
 
         // ── Step 2: Validate ticket type and event ────────────────────────────
         TicketType ticketType = ticketTypeRepository.findById(request.getTicketTypeId())
-                .orElseThrow(() -> BizException.of(ResultCode.TICKET_TYPE_NOT_FOUND));
+                .orElseThrow(() -> BizException.of(ResultCode.TICKET_TYPE_NOT_FOUND,
+                        "Ticket type not found: " + request.getTicketTypeId()));
 
-        // Validate the event is currently on sale
-        var event = eventRepository.findById(ticketType.getEvent().getId())
-                .orElseThrow(() -> BizException.of(ResultCode.EVENT_NOT_FOUND));
-
-        if (!event.isOnSale()) {
+        if (!ticketType.getEvent().isOnSale()) {
             throw BizException.of(ResultCode.EVENT_NOT_AVAILABLE,
-                    "Event '" + event.getName() + "' is not currently on sale");
+                    "Event is not currently on sale");
         }
 
-        // ── Step 3: Check stock before attempting deduction ───────────────────
-        if (!inventoryPort.hasSufficientStock(
-                request.getTicketTypeId(), request.getQuantity())) {
-            throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT);
-        }
-
-        // ── Step 4: Deduct inventory ──────────────────────────────────────────
-        // This may throw BizException if optimistic lock conflict occurs
+        // ── Step 3: Deduct inventory ──────────────────────────────────────────
+        // deductStock() is the single point of failure for inventory.
+        // No pre-check (hasSufficientStock) here — a separate check would introduce
+        // a TOCTOU race and create two different error paths for the same root cause.
         inventoryPort.deductStock(request.getTicketTypeId(), request.getQuantity());
 
-        // ── Step 5: Create order ──────────────────────────────────────────────
+        // ── Step 4: Create order ──────────────────────────────────────────────
         try {
-            String orderNo = generateOrderNo();
             Order order = Order.create(
-                    orderNo,
+                    generateOrderNo(),
                     userId,
                     request.getTicketTypeId(),
                     request.getQuantity(),
                     ticketType.getPrice(),
                     request.getRequestId()
             );
+
             orderRepository.save(order);
 
             log.info("[Order] Created: orderNo={}, userId={}, ticketTypeId={}, qty={}",
-                    orderNo, userId, request.getTicketTypeId(), request.getQuantity());
+                    order.getOrderNo(), userId, request.getTicketTypeId(),
+                    request.getQuantity());
 
             return OrderResponse.from(order);
 
         } catch (Exception e) {
-            // ── Step 6: Compensate — release inventory if order creation fails ─
-            // This is our manual SAGA compensation before Phase 2 messaging
+            if (e instanceof DataIntegrityViolationException) {
+                // Idempotency race: deductStock() succeeded, but save(order) hit the
+                // UNIQUE constraint because another thread committed first.
+                //
+                // Do NOT call releaseStock() here for two reasons:
+                // 1. The Hibernate session is corrupted after a constraint violation —
+                //    any further queries will throw AssertionFailure.
+                // 2. In Phase 1, the entire transaction (including deductStock) will
+                //    roll back automatically, so no compensation is needed.
+                //
+                // Phase 2 warning: when deductStock() becomes a Redis call outside
+                // this transaction, compensation WILL be needed here, but it must
+                // run in a fresh session/transaction, not this corrupted one.
+                throw e;
+            }
+
+            // For all other failures: compensate the inventory deduction.
+            //
+            // Phase 1 note: deductStock() and this method share the same @Transactional
+            // boundary. If we reach here, the re-thrown exception will roll back the
+            // entire transaction — including the inventory deduction. So releaseStock()
+            // is technically redundant in Phase 1, but it documents the intent and
+            // becomes load-bearing when Phase 2 moves deductStock() to Redis.
             log.error("[Order] Order creation failed, releasing inventory: " +
-                    "ticketTypeId={}, qty={}", request.getTicketTypeId(), request.getQuantity());
+                            "ticketTypeId={}, qty={}", request.getTicketTypeId(),
+                    request.getQuantity());
             inventoryPort.releaseStock(
                     request.getTicketTypeId(), request.getQuantity());
             throw e;
@@ -102,22 +154,18 @@ public class OrderService {
     public OrderResponse cancelOrder(String orderNo, Long userId) {
         Order order = findOrderByNo(orderNo);
 
-        // Ownership check — users can only cancel their own orders
         if (!order.getUserId().equals(userId)) {
             throw BizException.of(ResultCode.ORDER_CANCEL_NOT_ALLOWED,
                     "You are not authorized to cancel this order");
         }
 
-        if (!order.isCancellable()) {
-            throw BizException.of(ResultCode.ORDER_CANCEL_NOT_ALLOWED,
-                    "Order in status [" + order.getStatus() + "] cannot be cancelled");
-        }
-
-        // Drive state transition through state machine
+        // The state machine is the single source of truth for valid transitions.
+        // If CANCEL_BY_USER is not defined for the current status, handleEvent()
+        // throws ORDER_STATUS_INVALID. No pre-check needed — having both isCancellable()
+        // and the state machine creates two sources of truth that can silently diverge.
         orderStateMachine.handleEvent(order, OrderEvent.CANCEL_BY_USER,
                 "Cancelled by user");
 
-        // Release inventory — compensation for the original deduction
         inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
 
         orderRepository.save(order);
@@ -167,8 +215,7 @@ public class OrderService {
         Order order = findOrderByNo(orderNo);
 
         if (!order.getUserId().equals(userId)) {
-            throw BizException.of(ResultCode.ORDER_NOT_FOUND,
-                    "Order not found");
+            throw BizException.of(ResultCode.ORDER_NOT_FOUND, "Order not found");
         }
         return OrderResponse.from(order);
     }

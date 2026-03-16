@@ -1,6 +1,10 @@
 spring:
   flyway:
     enabled: true
+  datasource:
+    hikari:
+      maximum-pool-size: 150    # 50 threads × 2 connections per REQUIRES_NEW = 100 needed
+
   jpa:
     show-sql: false
     hibernate:
