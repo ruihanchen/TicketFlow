@@ -4,10 +4,24 @@ import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
 import lombok.Getter;
+import lombok.NoArgsConstructor;
 
 @Getter
+@NoArgsConstructor          // for Jackson deserialization
 public class CreateOrderRequest {
+    // Add to the bottom of CreateOrderRequest.java
+// Named explicitly to signal intent: this constructor exists for tests only.
+// Production code always deserializes this object from JSON via Jackson.
+    public static CreateOrderRequest forTest(Long ticketTypeId, Integer quantity, String requestId) {
+        CreateOrderRequest req = new CreateOrderRequest();
+        req.ticketTypeId = ticketTypeId;
+        req.quantity = quantity;
+        req.requestId = requestId;
+        return req;
+    }
 
     @NotNull(message = "Ticket type ID is required")
     private Long ticketTypeId;

@@ -26,6 +26,7 @@ public class InventoryAdapter implements InventoryPort {
         try {
             inventory.deduct(quantity);
             inventoryRepository.save(inventory);
+            inventoryRepository.flush();
             log.info("[Inventory] Deducted: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
         } catch (OptimisticLockingFailureException e) {
