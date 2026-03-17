@@ -125,8 +125,12 @@ public class OrderService {
                 // Do NOT call releaseStock() here for two reasons:
                 // 1. The Hibernate session is corrupted after a constraint violation —
                 //    any further queries will throw AssertionFailure.
-                // 2. In Phase 1, the entire transaction (including deductStock) will
-                //    roll back automatically, so no compensation is needed.
+                // 2. deductStock() already committed via REQUIRES_NEW. The real reason
+                //    we skip compensation here is Hibernate session corruption — any
+                //    further queries on this session will throw AssertionFailure.
+                //    This creates a known inventory leak risk for idempotency races.
+                //    Phase 2 Redis idempotency (SETNX) eliminates this race entirely,
+                //    making this code path unreachable in practice.
                 //
                 // Phase 2 warning: when deductStock() becomes a Redis call outside
                 // this transaction, compensation WILL be needed here, but it must
@@ -135,17 +139,21 @@ public class OrderService {
             }
 
             // For all other failures: compensate the inventory deduction.
-            //
-            // Phase 1 note: deductStock() and this method share the same @Transactional
-            // boundary. If we reach here, the re-thrown exception will roll back the
-            // entire transaction — including the inventory deduction. So releaseStock()
-            // is technically redundant in Phase 1, but it documents the intent and
-            // becomes load-bearing when Phase 2 moves deductStock() to Redis.
-            log.error("[Order] Order creation failed, releasing inventory: " +
-                            "ticketTypeId={}, qty={}", request.getTicketTypeId(),
-                    request.getQuantity());
-            inventoryPort.releaseStock(
+            // deductStock() runs in REQUIRES_NEW — its transaction committed independently
+            // before we reach here. releaseStock() is load-bearing in Phase 1, not just
+            // a Phase 2 preparation. If releaseStock() also fails, we have a data
+            // inconsistency that requires reconciliation.
+            log.error("[Order] Order creation failed, releasing inventory: ticketTypeId={}, qty={}",
                     request.getTicketTypeId(), request.getQuantity());
+            try {
+                inventoryPort.releaseStock(request.getTicketTypeId(), request.getQuantity());
+            } catch (Exception compensationException) {
+                log.error("[CRITICAL] Inventory compensation failed. Manual reconciliation required. " +
+                                "ticketTypeId={}, quantity={}, originalError='{}', compensationError='{}'",
+                        request.getTicketTypeId(), request.getQuantity(),
+                        e.getMessage(), compensationException.getMessage());
+                // Intentionally not rethrowing — original exception has higher diagnostic value.
+            }
             throw e;
         }
     }
