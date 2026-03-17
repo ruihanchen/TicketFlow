@@ -32,6 +32,27 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- Redis -->
+        <!--
+            spring-boot-starter-data-redis pulls in Lettuce (the default client).
+            Lettuce connects lazily — if Redis is unavailable at startup, the app
+            still starts. Connection failure surfaces only when Redis is first used,
+            allowing our fallback path in RedisInventoryAdapter to handle it.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!--
+            commons-pool2 is required to enable Lettuce connection pooling.
+            Without this on the classpath, the lettuce.pool config in
+            application.yml is silently ignored — a subtle runtime surprise.
+        -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
+
         <!-- Security -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -64,14 +85,13 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
-
         <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
         </dependency>
 
-        <!-- testing -->
+        <!-- Testing -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
@@ -110,7 +130,6 @@
             <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
     </dependencies>
-
 
     <build>
         <plugins>

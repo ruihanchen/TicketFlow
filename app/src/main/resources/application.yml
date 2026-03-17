@@ -18,6 +18,26 @@ spring:
       connection-timeout: 30000
       idle-timeout: 600000
 
+  data:
+    redis:
+      # Override via REDIS_HOST / REDIS_PORT env vars in Docker or staging.
+      # Defaults to localhost for local development.
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # Fail fast on unavailable Redis — 2s is enough for a local/Docker hop.
+      # Without this, a dead Redis blocks each request for the default 60s timeout,
+      # making the fallback path feel like a hang rather than a graceful degradation.
+      timeout: 2000ms
+      lettuce:
+        pool:
+          # Size the pool relative to the HikariCP pool (10).
+          # Redis ops are faster than DB ops, so fewer connections suffice.
+          max-active: 8
+          max-idle: 4
+          min-idle: 1
+          # Don't queue indefinitely — surface back-pressure quickly.
+          max-wait: 500ms
+
   jpa:
     hibernate:
       ddl-auto: validate
