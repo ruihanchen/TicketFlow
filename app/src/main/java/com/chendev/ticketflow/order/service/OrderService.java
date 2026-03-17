@@ -228,6 +228,16 @@ public class OrderService {
         );
     }
 
+    @Transactional
+    public void cancelOrderBySystem(String orderNo) {
+        Order order = findOrderByNo(orderNo);
+        orderStateMachine.handleEvent(order, OrderEvent.SYSTEM_TIMEOUT,
+                "Order expired after 15 minutes");
+        inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
+        orderRepository.save(order);
+        log.info("[Order] Cancelled by system timeout: orderNo={}", orderNo);
+    }
+
     // ─── Private helpers ──────────────────────────────────────────────────────
 
     private Order findOrderByNo(String orderNo) {

@@ -109,4 +109,9 @@ public class Order {
     public List<OrderStatusHistory> getStatusHistory() {
         return Collections.unmodifiableList(statusHistory);
     }
+
+    // For testing: backdates expiredAt to simulate timeout having elapsed.
+    public void expireNow() {
+        this.expiredAt = LocalDateTime.now().minusSeconds(1);
+    }
 }
