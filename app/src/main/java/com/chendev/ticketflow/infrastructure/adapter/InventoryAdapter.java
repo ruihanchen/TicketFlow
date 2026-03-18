@@ -8,6 +8,7 @@ import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Primary;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -25,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
  * the Port & Adapter boundary absorbs the technology switch entirely.
  */
 @Slf4j
+//@Primary
 @Component
 @RequiredArgsConstructor
 public class InventoryAdapter implements InventoryPort {
