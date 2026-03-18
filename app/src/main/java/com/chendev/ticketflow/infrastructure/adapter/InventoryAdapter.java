@@ -38,8 +38,7 @@ public class InventoryAdapter implements InventoryPort {
     // Without this, the outer createOrder() transaction would be poisoned before
     // its catch blocks have a chance to execute recovery logic.
     @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW,
-            noRollbackFor = BizException.class)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void deductStock(Long ticketTypeId, int quantity) {
         Inventory inventory = findInventory(ticketTypeId);
         try {
