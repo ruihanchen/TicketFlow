@@ -3,6 +3,7 @@ package com.chendev.ticketflow;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -16,73 +17,62 @@ public abstract class IntegrationTestBase {
 
     // ── PostgreSQL ────────────────────────────────────────────────────────────
 
-    // Singleton: one container for the entire JVM process.
-    // All test classes share one Spring ApplicationContext because
-    // DynamicPropertySource always returns the same connection URL.
     static final PostgreSQLContainer<?> postgres =
             new PostgreSQLContainer<>("postgres:16-alpine")
                     .withDatabaseName("ticketflow_test")
                     .withUsername("test")
                     .withPassword("test")
-                    .withCommand("postgres -c max_connections=300");
+                    // max_connections must exceed the HikariCP pool ceiling (420).
+                    // 500 = 420 pool + 80 buffer for internal Postgres background connections.
+                    // Phase 1 used 300 (sized for the 150-connection pool).
+                    .withCommand("postgres -c max_connections=500");
 
     // ── Redis ─────────────────────────────────────────────────────────────────
 
-    // Singleton alongside PostgreSQL: same lifecycle, same rationale.
-    //
-    // Why Redis in IntegrationTestBase (not just in future Redis-specific tests)?
-    //
-    // Spring Boot auto-configures a RedisConnectionFactory as soon as
-    // spring-boot-starter-data-redis is on the classpath. If no Redis is
-    // reachable, the first actual Redis operation throws — but startup succeeds
-    // (Lettuce connects lazily). However, once RedisInventoryAdapter is @Primary,
-    // every test that triggers createOrder() will attempt a Redis call.
-    //
-    // Adding Redis here ensures:
-    //   1. All existing tests continue to pass today (Redis available but unused).
-    //   2. No test configuration changes are needed when RedisInventoryAdapter
-    //      becomes active in Step 1-H — the container is already there.
-    //   3. The single shared ApplicationContext is preserved — adding Redis
-    //      to DynamicPropertySource here avoids a context reload per test class.
     @SuppressWarnings("resource")
     static final GenericContainer<?> redis =
             new GenericContainer<>("redis:7-alpine")
                     .withExposedPorts(6379);
 
     static {
-        // Start both containers in parallel to keep total startup time low.
         postgres.start();
         redis.start();
     }
 
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
-        // PostgreSQL
         registry.add("spring.datasource.url",      postgres::getJdbcUrl);
         registry.add("spring.datasource.username",  postgres::getUsername);
         registry.add("spring.datasource.password",  postgres::getPassword);
-
-        // Redis — Testcontainers maps the container's 6379 to a random host port.
-        // We register that mapped port so Spring connects to the right place.
-        registry.add("spring.data.redis.host", redis::getHost);
-        registry.add("spring.data.redis.port", () -> redis.getMappedPort(6379));
+        registry.add("spring.data.redis.host",      redis::getHost);
+        registry.add("spring.data.redis.port",      () -> redis.getMappedPort(6379));
     }
 
-    @Autowired
-    private JdbcTemplate jdbcTemplate;
+    @Autowired private JdbcTemplate        jdbcTemplate;
+    @Autowired private StringRedisTemplate redisTemplate;
 
     @BeforeEach
     protected void cleanDatabase() {
+        // Wipe all DB tables and reset sequences.
         jdbcTemplate.execute(
                 "TRUNCATE TABLE order_status_history, orders, inventories, " +
                         "ticket_types, events, users RESTART IDENTITY CASCADE"
         );
-        // Redis is not flushed here intentionally.
-        // Phase 1 tests do not write to Redis.
-        // When RedisInventoryAdapter becomes active (Step 1-H), individual
-        // test classes that need a clean Redis state will call
-        // redisTemplate.getConnectionFactory().getConnection().flushDb()
-        // in their own @BeforeEach — keeping the cleanup scope as narrow
-        // as possible.
+
+        // Flush all Redis keys written by the previous test.
+        //
+        // Why flush here rather than selectively deleting inventory keys?
+        // Selective deletion (KEYS pattern + DEL) is fragile — if a new key
+        // prefix is introduced, tests start leaking state silently. FLUSHDB
+        // is unconditional and cheap in a test container with no real data.
+        //
+        // This flush is essential now that RedisInventoryAdapter is @Primary:
+        // a stale "inventory:ticketType:1 = 0" key left by the previous test
+        // would bypass lazy-load and cause the next test to see sold-out
+        // inventory from the start, producing non-deterministic failures.
+        redisTemplate.getConnectionFactory()
+                .getConnection()
+                .serverCommands()
+                .flushDb();
     }
 }

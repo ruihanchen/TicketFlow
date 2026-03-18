@@ -8,15 +8,24 @@ import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.annotation.Primary;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
+/**
+ * DB-backed inventory adapter using JPA optimistic locking.
+ *
+ * Active in two scenarios:
+ *   1. Phase 1 — sole InventoryPort implementation
+ *   2. Phase 2 — fallback when Redis is unavailable
+ *
+ * In Phase 2, RedisInventoryAdapter (@Primary) delegates here on
+ * RedisException. This adapter requires no changes for that role —
+ * the Port & Adapter boundary absorbs the technology switch entirely.
+ */
 @Slf4j
 @Component
-@Primary
 @RequiredArgsConstructor
 public class InventoryAdapter implements InventoryPort {
 
@@ -29,7 +38,8 @@ public class InventoryAdapter implements InventoryPort {
     // Without this, the outer createOrder() transaction would be poisoned before
     // its catch blocks have a chance to execute recovery logic.
     @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.REQUIRES_NEW,
+            noRollbackFor = BizException.class)
     public void deductStock(Long ticketTypeId, int quantity) {
         Inventory inventory = findInventory(ticketTypeId);
         try {

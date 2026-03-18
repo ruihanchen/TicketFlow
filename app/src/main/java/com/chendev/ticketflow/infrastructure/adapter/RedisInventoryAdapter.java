@@ -8,28 +8,24 @@ import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Redis-backed inventory adapter.
+ * Redis-backed implementation of InventoryPort.
  *
- * Replaces InventoryAdapter (optimistic locking) as the active
- * InventoryPort implementation for Phase 2.
+ * Deductions are atomic via Lua script — no optimistic lock retries,
+ * no retry storms under flash sale load. DB is kept in sync via a
+ * conditional guard write after every successful Redis deduction.
  *
- * Build order:
- *   Step 1-C : Lua execution + basic return code handling
- *   Step 1-D : Cache miss → lazy-load from DB
- *   Step 1-E : Redis connection failure → fallback to DB
- *   Step 1-F : DB guard write after Redis success + compensation  ← current step
- *   Step 1-G : Reconciliation job (separate class)
- *   Step 1-H : Add @Primary — this adapter becomes the active one
- *
- * NOT annotated with @Primary yet.
- * InventoryAdapter (@Primary) remains active until Step 1-H.
+ * Degradation path: any RedisException falls back to InventoryAdapter
+ * (optimistic locking). The system remains fully functional at reduced
+ * throughput — no errors surface to the caller.
  */
 @Slf4j
+@Primary
 @Component
 @RequiredArgsConstructor
 public class RedisInventoryAdapter implements InventoryPort {
@@ -37,10 +33,11 @@ public class RedisInventoryAdapter implements InventoryPort {
     private final RedisInventoryManager redisInventoryManager;
     private final InventoryRepository   inventoryRepository;
 
-    // Fallback to Phase 1 optimistic-locking adapter when Redis is unavailable.
-    // Why delegate to InventoryAdapter instead of calling InventoryRepository directly?
-    // InventoryAdapter already encapsulates optimistic lock retry and exception mapping.
-    // Duplicating that logic here would create two sources of truth for the same behaviour.
+    // Fallback to DB-backed adapter when Redis is unavailable.
+    // Delegates to InventoryAdapter rather than calling InventoryRepository
+    // directly because InventoryAdapter already owns optimistic lock retry
+    // and exception mapping. Duplicating that logic here would create two
+    // sources of truth for the same behaviour.
     private final InventoryAdapter dbFallbackAdapter;
 
     // ─── InventoryPort implementation ────────────────────────────────────────
@@ -54,8 +51,7 @@ public class RedisInventoryAdapter implements InventoryPort {
      * governs the DB guard write that follows.
      *
      * noRollbackFor = BizException: business rejections (sold out, not found)
-     * must not poison the outer transaction's rollback state. Only unexpected
-     * infrastructure failures should trigger a rollback here.
+     * must not poison the outer transaction's rollback state.
      */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW,
@@ -70,12 +66,10 @@ public class RedisInventoryAdapter implements InventoryPort {
             }
 
             handleDeductResult(result, ticketTypeId);
-
-            // Redis deduction succeeded — now persist to DB as the source of truth.
             persistDeductToDB(ticketTypeId, quantity);
 
         } catch (BizException e) {
-            // Business rejection (sold out, not found) — propagate unchanged.
+            // Business rejection — propagate unchanged.
             // No Redis compensation needed: Redis correctly reflects the state.
             throw e;
         } catch (Exception e) {
@@ -106,7 +100,7 @@ public class RedisInventoryAdapter implements InventoryPort {
 
             if (Long.valueOf(0L).equals(result)) {
                 // Key absent after Redis restart — release directly in DB.
-                // Reconciliation job will rebuild the Redis key from DB on next read.
+                // Reconciliation job will rebuild the Redis key on next read.
                 log.warn("[RedisInventory] Key absent in Redis during release, "
                         + "writing directly to DB: ticketTypeId={}", ticketTypeId);
                 persistReleaseToDB(ticketTypeId, quantity);
@@ -144,23 +138,18 @@ public class RedisInventoryAdapter implements InventoryPort {
     /**
      * Persists a Redis deduction to DB using a conditional UPDATE.
      *
-     * Why a conditional UPDATE instead of load-then-save?
      * A load-then-save (SELECT + UPDATE) has a race window: two threads could
-     * both SELECT the same value and produce an incorrect result. The conditional
-     * UPDATE is atomic at the DB level — no race window exists.
+     * both SELECT the same value and produce an incorrect final result. The
+     * conditional UPDATE is atomic at the DB level — no race window exists.
      *
-     * When affected rows == 0:
-     * DB available_stock < quantity, meaning Redis and DB have drifted.
-     * Redis was already deducted, so we must compensate — add the quantity back
-     * to Redis — then reject the order. The caller's transaction will roll back,
-     * leaving DB clean. Redis is restored. Reconciliation will confirm consistency.
+     * When affected rows == 0, Redis and DB have drifted. Redis was already
+     * deducted, so compensate before rejecting. The caller's transaction rolls
+     * back, leaving DB clean. Reconciliation confirms consistency.
      */
     private void persistDeductToDB(Long ticketTypeId, int quantity) {
         int updated = inventoryRepository.guardDeductStock(ticketTypeId, quantity);
 
         if (updated == 0) {
-            // DB says insufficient despite Redis succeeding — drift detected.
-            // Compensate Redis before rejecting.
             compensateRedis(ticketTypeId, quantity);
             throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT,
                     "Tickets sold out (DB guard check failed)");
@@ -172,9 +161,6 @@ public class RedisInventoryAdapter implements InventoryPort {
 
     /**
      * Persists a stock release to DB.
-     *
-     * Unconditional increment — stock can only go up on cancellation.
-     * Logs a warning if the inventory record is unexpectedly missing.
      */
     private void persistReleaseToDB(Long ticketTypeId, int quantity) {
         int updated = inventoryRepository.guardReleaseStock(ticketTypeId, quantity);
@@ -182,19 +168,17 @@ public class RedisInventoryAdapter implements InventoryPort {
         if (updated == 0) {
             log.error("[RedisInventory] DB release failed — inventory record missing: "
                     + "ticketTypeId={}. Manual reconciliation required.", ticketTypeId);
-            return;
+        } else {
+            log.info("[RedisInventory] DB release write succeeded: ticketTypeId={}, qty={}",
+                    ticketTypeId, quantity);
         }
-
-        log.info("[RedisInventory] DB release write succeeded: ticketTypeId={}, qty={}",
-                ticketTypeId, quantity);
     }
 
     /**
-     * Adds quantity back to Redis after a DB guard write failure.
+     * Adds quantity back to Redis after a DB guard write failure (best-effort).
      *
-     * This is best-effort compensation. If Redis is also unavailable at this
-     * point, the stock is temporarily under-counted in Redis. The reconciliation
-     * job will detect and correct this drift within its next scheduled run.
+     * If Redis is also unavailable, the stock is temporarily under-counted.
+     * InventoryReconciler will detect and correct this drift on its next run.
      */
     private void compensateRedis(Long ticketTypeId, int quantity) {
         try {
@@ -202,9 +186,6 @@ public class RedisInventoryAdapter implements InventoryPort {
             log.info("[RedisInventory] Redis compensation succeeded: "
                     + "ticketTypeId={}, qty={}", ticketTypeId, quantity);
         } catch (Exception compensationEx) {
-            // Both DB write and Redis compensation failed.
-            // Stock is temporarily under-counted in Redis.
-            // Reconciliation job will correct this drift.
             log.error("[RedisInventory] COMPENSATION FAILED — manual reconciliation required: "
                             + "ticketTypeId={}, qty={}, reason={}",
                     ticketTypeId, quantity, compensationEx.getMessage());
@@ -215,7 +196,8 @@ public class RedisInventoryAdapter implements InventoryPort {
      * Loads available_stock from DB and writes it to Redis on cache miss.
      *
      * Concurrent cache misses are safe — both threads write the same committed
-     * DB value; last-writer-wins is harmless at this point.
+     * DB value; last-writer-wins is harmless at this point because the Lua
+     * deduction has not yet run for either thread.
      */
     private void loadInventoryIntoRedis(Long ticketTypeId) {
         Inventory inventory = inventoryRepository.findByTicketTypeId(ticketTypeId)
@@ -244,7 +226,7 @@ public class RedisInventoryAdapter implements InventoryPort {
 
         if (Long.valueOf(-1L).equals(result)) {
             // Key evicted immediately after lazy-load SET — extremely rare.
-            // Check Redis maxmemory-policy if this appears in production logs.
+            // If this appears in production logs, check Redis maxmemory-policy.
             throw new IllegalStateException(
                     "[RedisInventory] Key evicted immediately after lazy-load: "
                             + "ticketTypeId=" + ticketTypeId
