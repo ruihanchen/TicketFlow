@@ -32,15 +32,40 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * Test B: Idempotency
+ *
+ * Validates two distinct idempotency scenarios:
+ *
+ *   1. Concurrent duplicates: 50 threads fire the same requestId simultaneously.
+ *      Phase 1 behaviour: session poisoning caused UnexpectedRollbackException (HTTP 500).
+ *      Phase 2 behaviour: Redis SETNX fast-fails all duplicates with IDEMPOTENT_REJECTION
+ *      (HTTP 400). Zero 500 errors. The core architectural improvement.
+ *
+ *   2. Sequential duplicate: after all concurrent threads complete, a fresh request
+ *      is sent with the same requestId. Redis key now holds the orderNo (24h TTL).
+ *      Expected: immediate cache hit, same orderNo returned, zero DB writes.
+ *
+ * Why successCount >= 2 is the wrong assertion for concurrent duplicates:
+ *   Under nanosecond-level concurrency, threads 2-50 arrive while thread 1 is still
+ *   in-flight (PROCESSING state). They are fast-failed immediately — this is correct
+ *   Fail-Fast behaviour that preserves Tomcat thread pool capacity. Expecting >= 2
+ *   "cache hits" in the concurrent phase assumes a timing that is not guaranteed and
+ *   would require Thread.sleep() in the server code — a production anti-pattern that
+ *   can exhaust the thread pool under load.
+ *
+ *   The real Phase 2 value is not "more threads succeed concurrently" but rather
+ *   "zero threads receive a 500 Internal Server Error". That is what we assert.
+ */
 class IdempotencyTest extends IntegrationTestBase {
 
-    @Autowired private OrderService orderService;
-    @Autowired private OrderRepository orderRepository;
-    @Autowired private InventoryRepository inventoryRepository;
+    @Autowired private OrderService         orderService;
+    @Autowired private OrderRepository      orderRepository;
+    @Autowired private InventoryRepository  inventoryRepository;
     @Autowired private TicketTypeRepository ticketTypeRepository;
-    @Autowired private EventRepository eventRepository;
-    @Autowired private UserRepository userRepository;
-    @Autowired private PasswordEncoder passwordEncoder;
+    @Autowired private EventRepository      eventRepository;
+    @Autowired private UserRepository       userRepository;
+    @Autowired private PasswordEncoder      passwordEncoder;
 
     private static final int THREAD_COUNT = 50;
 
@@ -49,11 +74,7 @@ class IdempotencyTest extends IntegrationTestBase {
 
     @BeforeEach
     void setUp() {
-        orderRepository.deleteAll();
-        inventoryRepository.deleteAll();
-        ticketTypeRepository.deleteAll();
-        eventRepository.deleteAll();
-        userRepository.deleteAll();
+        // IntegrationTestBase.cleanDatabase() handles TRUNCATE + Redis FLUSHDB.
 
         Event event = Event.create(
                 "Idempotency Test Concert",
@@ -72,7 +93,6 @@ class IdempotencyTest extends IntegrationTestBase {
         ticketType = ticketTypeRepository.save(ticketType);
         ticketTypeId = ticketType.getId();
 
-        // Plenty of stock — this test is about idempotency, not inventory contention
         inventoryRepository.save(Inventory.initialize(ticketTypeId, 100));
 
         User user = User.create(
@@ -85,14 +105,11 @@ class IdempotencyTest extends IntegrationTestBase {
 
     @Test
     void sameRequestId_concurrentSubmissions_onlyOneOrderCreated() throws InterruptedException {
-        // All 50 threads share the exact same requestId —
-        // simulating a user whose browser fires 50 duplicate requests simultaneously
+
         final String sharedRequestId = UUID.randomUUID().toString();
 
-        AtomicInteger successCount         = new AtomicInteger(0);
-        // Threads blocked by idempotency check (IDEMPOTENT_REJECTION or returned existing order)
+        AtomicInteger successCount          = new AtomicInteger(0);
         AtomicInteger idempotentRejectCount = new AtomicInteger(0);
-        // Threads that failed for unexpected reasons — should always be 0
         AtomicInteger unexpectedFailCount   = new AtomicInteger(0);
 
         Set<String> returnedOrderNos = ConcurrentHashMap.newKeySet();
@@ -118,16 +135,13 @@ class IdempotencyTest extends IntegrationTestBase {
                         unexpectedFailCount.incrementAndGet();
                         e.printStackTrace();
                     }
-                } catch (org.springframework.transaction.UnexpectedRollbackException e) {
-                    // Phase 1 known limitation: JPA/Hibernate session is corrupted after a
-                    // constraint violation. Spring overrides our BizException(IDEMPOTENT_REJECTION)
-                    // with this exception. The DB unique constraint DID enforce idempotency correctly
-                    // (no duplicate order was created). This path disappears in Phase 2 when
-                    // Redis SETNX prevents concurrent threads from reaching the save() step.
-                    idempotentRejectCount.incrementAndGet();
                 } catch (Exception e) {
+                    // Phase 2: UnexpectedRollbackException must not appear here.
+                    // Redis SETNX prevents concurrent threads from reaching save(),
+                    // so Hibernate session poisoning cannot occur.
+                    // Any exception landing here is a genuine unexpected failure.
                     unexpectedFailCount.incrementAndGet();
-                    System.err.printf("[UNEXPECTED Exception] type=%s, message=%s%n",
+                    System.err.printf("[UNEXPECTED] type=%s, message=%s%n",
                             e.getClass().getSimpleName(), e.getMessage());
                     e.printStackTrace();
                 } finally {
@@ -140,37 +154,68 @@ class IdempotencyTest extends IntegrationTestBase {
         doneLatch.await();
         executor.shutdown();
 
-        // ── Assertions — ordered from most fundamental to most specific ────────
+        // ── Concurrent duplicate assertions ───────────────────────────────────
 
-        // 1. No unexpected failures — if this fails, read the stack traces above
+        // Phase 2 core guarantee: zero 500 errors.
+        // Phase 1 had UnexpectedRollbackException (HTTP 500) from Hibernate session
+        // poisoning. Redis SETNX eliminates this by preventing concurrent threads
+        // from reaching the DB save() step entirely.
         assertThat(unexpectedFailCount.get())
-                .as("Zero unexpected exceptions — all failures must be intentional " +
-                        "idempotency rejections, not system errors")
+                .as("Phase 2 core guarantee: zero unexpected exceptions. "
+                        + "Phase 1 had UnexpectedRollbackException here.")
                 .isEqualTo(0);
 
-        // 2. At least one thread must have succeeded and created the order
-        assertThat(successCount.get())
-                .as("At least one thread must have received a successful response")
-                .isGreaterThanOrEqualTo(1);
-
-        // 3. Exactly one order in DB — the core correctness guarantee
+        // Exactly one order in DB.
         assertThat(orderRepository.count())
                 .as("Only one order must be persisted regardless of concurrent submissions")
                 .isEqualTo(1);
 
-        // 4. All successful responses carried the same orderNo
-        //    (idempotency means: same input → same output, not just "no duplicate row")
+        // At least one thread succeeded.
+        assertThat(successCount.get())
+                .as("At least one thread must receive a successful response")
+                .isGreaterThanOrEqualTo(1);
+
+        // All successful responses carried the same orderNo.
         assertThat(returnedOrderNos)
                 .as("All successful responses must return the identical orderNo")
                 .hasSize(1);
 
+        // ── Sequential duplicate assertion ────────────────────────────────────
+        //
+        // All 50 concurrent threads have now finished. Thread 1 has called
+        // markIdempotencyCompleted(), so the Redis key holds the real orderNo
+        // with a 24h TTL.
+        //
+        // This models the real-world "user retries 5 minutes later" scenario:
+        //   - Network timeout, user clicks Buy again.
+        //   - Redis cache hit: same orderNo returned immediately.
+        //   - No inventory deducted again. No new order row in DB.
+        //
+        // This is the other half of idempotency that the concurrent test cannot
+        // cover, because in the concurrent phase the key is still PROCESSING.
+        String firstOrderNo = returnedOrderNos.iterator().next();
+
+        OrderResponse sequentialDuplicate = orderService.createOrder(userId,
+                CreateOrderRequest.forTest(ticketTypeId, 1, sharedRequestId));
+
+        assertThat(sequentialDuplicate.getOrderNo())
+                .as("Sequential duplicate must return the cached orderNo from Redis — "
+                        + "not create a new order")
+                .isEqualTo(firstOrderNo);
+
+        assertThat(orderRepository.count())
+                .as("Sequential duplicate must not create a new order in DB")
+                .isEqualTo(1);
+
         System.out.printf(
-                "%n[Idempotency Test] threads=%d, success=%d, " +
-                        "idempotent_rejected=%d, unexpected_fail=%d, " +
-                        "distinct_orderNos=%d, db_orders=%d%n",
+                "%n[Idempotency Test] threads=%d, success=%d, "
+                        + "idempotent_rejected=%d, unexpected_fail=%d, "
+                        + "distinct_orderNos=%d, db_orders=%d%n"
+                        + "[Sequential duplicate] cached orderNo=%s (matches original: %b)%n",
                 THREAD_COUNT, successCount.get(),
                 idempotentRejectCount.get(), unexpectedFailCount.get(),
-                returnedOrderNos.size(), orderRepository.count()
-        );
+                returnedOrderNos.size(), orderRepository.count(),
+                sequentialDuplicate.getOrderNo(),
+                sequentialDuplicate.getOrderNo().equals(firstOrderNo));
     }
 }
