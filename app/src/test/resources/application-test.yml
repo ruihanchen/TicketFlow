@@ -12,4 +12,6 @@ spring:
 
 ticketflow:
   timeout:
-    fixed-delay: 3600000
+    fixed-delay: 3600000          # 1 hour — prevent timeout job from firing during tests
+  reconciliation:
+    fixed-delay: 3600000          # 1 hour — prevent reconciliation job from firing during tests
