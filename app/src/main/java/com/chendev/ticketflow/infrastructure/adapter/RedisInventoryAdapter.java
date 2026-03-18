@@ -8,8 +8,9 @@ import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Redis-backed inventory adapter.
@@ -20,8 +21,8 @@ import org.springframework.stereotype.Component;
  * Build order:
  *   Step 1-C : Lua execution + basic return code handling
  *   Step 1-D : Cache miss → lazy-load from DB
- *   Step 1-E : Redis connection failure → fallback to DB   ← current step
- *   Step 1-F : DB guard write after Redis success + compensation
+ *   Step 1-E : Redis connection failure → fallback to DB
+ *   Step 1-F : DB guard write after Redis success + compensation  ← current step
  *   Step 1-G : Reconciliation job (separate class)
  *   Step 1-H : Add @Primary — this adapter becomes the active one
  *
@@ -37,9 +38,6 @@ public class RedisInventoryAdapter implements InventoryPort {
     private final InventoryRepository   inventoryRepository;
 
     // Fallback to Phase 1 optimistic-locking adapter when Redis is unavailable.
-    // Declared as a field dependency rather than looked up at runtime so that
-    // Spring wires it at startup — no ServiceLocator pattern needed.
-    //
     // Why delegate to InventoryAdapter instead of calling InventoryRepository directly?
     // InventoryAdapter already encapsulates optimistic lock retry and exception mapping.
     // Duplicating that logic here would create two sources of truth for the same behaviour.
@@ -48,14 +46,20 @@ public class RedisInventoryAdapter implements InventoryPort {
     // ─── InventoryPort implementation ────────────────────────────────────────
 
     /**
-     * Deducts stock atomically via Lua script.
+     * Deducts stock atomically via Lua script, then persists to DB.
      *
-     * Happy path  : Lua → (cache miss → lazy-load → retry) → success
-     * Failure path: any RedisException → WARN log → delegate to DB adapter
+     * REQUIRES_NEW: this transaction commits independently from the outer
+     * OrderService transaction, matching the behaviour of InventoryAdapter.
+     * Redis runs outside any JPA transaction scope — this annotation only
+     * governs the DB guard write that follows.
      *
-     * DB guard write is added in Step 1-F.
+     * noRollbackFor = BizException: business rejections (sold out, not found)
+     * must not poison the outer transaction's rollback state. Only unexpected
+     * infrastructure failures should trigger a rollback here.
      */
     @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW,
+            noRollbackFor = BizException.class)
     public void deductStock(Long ticketTypeId, int quantity) {
         try {
             Long result = redisInventoryManager.deductStock(ticketTypeId, quantity);
@@ -67,13 +71,14 @@ public class RedisInventoryAdapter implements InventoryPort {
 
             handleDeductResult(result, ticketTypeId);
 
+            // Redis deduction succeeded — now persist to DB as the source of truth.
+            persistDeductToDB(ticketTypeId, quantity);
+
         } catch (BizException e) {
-            // Business exceptions (INSUFFICIENT_STOCK, TICKET_TYPE_NOT_FOUND) must
-            // propagate to the caller unchanged — do NOT fall back on business errors.
+            // Business rejection (sold out, not found) — propagate unchanged.
+            // No Redis compensation needed: Redis correctly reflects the state.
             throw e;
         } catch (Exception e) {
-            // Redis infrastructure failure (connection refused, timeout, etc.).
-            // Degrade gracefully: the system is slower but fully functional.
             log.warn("[RedisInventory] Redis unavailable, falling back to DB adapter: "
                     + "ticketTypeId={}, reason={}", ticketTypeId, e.getMessage());
             dbFallbackAdapter.deductStock(ticketTypeId, quantity);
@@ -81,36 +86,35 @@ public class RedisInventoryAdapter implements InventoryPort {
     }
 
     /**
-     * Returns stock to Redis when an order is cancelled or expired.
+     * Returns stock to Redis then persists the release to DB.
      *
-     * On Redis failure: WARN log only.
-     * The reconciliation job (Step 1-G) will detect and correct the drift.
-     *
-     * DB release write added in Step 1-F.
+     * REQUIRES_NEW: same rationale as deductStock.
      */
     @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW,
+            noRollbackFor = BizException.class)
     public void releaseStock(Long ticketTypeId, int quantity) {
         try {
             Long result = redisInventoryManager.releaseStock(ticketTypeId, quantity);
 
             if (Long.valueOf(1L).equals(result)) {
-                log.info("[RedisInventory] Released: ticketTypeId={}, qty={}",
+                log.info("[RedisInventory] Released in Redis: ticketTypeId={}, qty={}",
                         ticketTypeId, quantity);
+                persistReleaseToDB(ticketTypeId, quantity);
                 return;
             }
 
             if (Long.valueOf(0L).equals(result)) {
-                log.warn("[RedisInventory] Release skipped — key absent in Redis: "
-                                + "ticketTypeId={}. Reconciliation job will restore from DB.",
-                        ticketTypeId);
+                // Key absent after Redis restart — release directly in DB.
+                // Reconciliation job will rebuild the Redis key from DB on next read.
+                log.warn("[RedisInventory] Key absent in Redis during release, "
+                        + "writing directly to DB: ticketTypeId={}", ticketTypeId);
+                persistReleaseToDB(ticketTypeId, quantity);
             }
 
         } catch (BizException e) {
             throw e;
         } catch (Exception e) {
-            // Redis unavailable during release.
-            // Fall back to DB adapter to ensure the DB stock is restored.
-            // Redis drift will be corrected by the reconciliation job.
             log.warn("[RedisInventory] Redis unavailable during releaseStock, "
                             + "falling back to DB adapter: ticketTypeId={}, reason={}",
                     ticketTypeId, e.getMessage());
@@ -119,10 +123,8 @@ public class RedisInventoryAdapter implements InventoryPort {
     }
 
     /**
-     * Pre-flight stock check.
-     *
-     * On Redis failure: fall back to DB check conservatively.
-     * Returns false on any exception so that deductStock() makes the final call.
+     * Pre-flight stock check — a hint for early rejection, not an atomic guarantee.
+     * The Lua script in deductStock is the correctness boundary, not this method.
      */
     @Override
     public boolean hasSufficientStock(Long ticketTypeId, int quantity) {
@@ -140,10 +142,80 @@ public class RedisInventoryAdapter implements InventoryPort {
     // ─── Private helpers ─────────────────────────────────────────────────────
 
     /**
-     * Loads available_stock from DB and writes it to Redis.
+     * Persists a Redis deduction to DB using a conditional UPDATE.
      *
-     * Called on cache miss. Concurrent calls are safe — both threads write
-     * the same committed DB value; last-writer-wins is harmless here.
+     * Why a conditional UPDATE instead of load-then-save?
+     * A load-then-save (SELECT + UPDATE) has a race window: two threads could
+     * both SELECT the same value and produce an incorrect result. The conditional
+     * UPDATE is atomic at the DB level — no race window exists.
+     *
+     * When affected rows == 0:
+     * DB available_stock < quantity, meaning Redis and DB have drifted.
+     * Redis was already deducted, so we must compensate — add the quantity back
+     * to Redis — then reject the order. The caller's transaction will roll back,
+     * leaving DB clean. Redis is restored. Reconciliation will confirm consistency.
+     */
+    private void persistDeductToDB(Long ticketTypeId, int quantity) {
+        int updated = inventoryRepository.guardDeductStock(ticketTypeId, quantity);
+
+        if (updated == 0) {
+            // DB says insufficient despite Redis succeeding — drift detected.
+            // Compensate Redis before rejecting.
+            compensateRedis(ticketTypeId, quantity);
+            throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT,
+                    "Tickets sold out (DB guard check failed)");
+        }
+
+        log.info("[RedisInventory] DB guard write succeeded: ticketTypeId={}, qty={}",
+                ticketTypeId, quantity);
+    }
+
+    /**
+     * Persists a stock release to DB.
+     *
+     * Unconditional increment — stock can only go up on cancellation.
+     * Logs a warning if the inventory record is unexpectedly missing.
+     */
+    private void persistReleaseToDB(Long ticketTypeId, int quantity) {
+        int updated = inventoryRepository.guardReleaseStock(ticketTypeId, quantity);
+
+        if (updated == 0) {
+            log.error("[RedisInventory] DB release failed — inventory record missing: "
+                    + "ticketTypeId={}. Manual reconciliation required.", ticketTypeId);
+            return;
+        }
+
+        log.info("[RedisInventory] DB release write succeeded: ticketTypeId={}, qty={}",
+                ticketTypeId, quantity);
+    }
+
+    /**
+     * Adds quantity back to Redis after a DB guard write failure.
+     *
+     * This is best-effort compensation. If Redis is also unavailable at this
+     * point, the stock is temporarily under-counted in Redis. The reconciliation
+     * job will detect and correct this drift within its next scheduled run.
+     */
+    private void compensateRedis(Long ticketTypeId, int quantity) {
+        try {
+            redisInventoryManager.releaseStock(ticketTypeId, quantity);
+            log.info("[RedisInventory] Redis compensation succeeded: "
+                    + "ticketTypeId={}, qty={}", ticketTypeId, quantity);
+        } catch (Exception compensationEx) {
+            // Both DB write and Redis compensation failed.
+            // Stock is temporarily under-counted in Redis.
+            // Reconciliation job will correct this drift.
+            log.error("[RedisInventory] COMPENSATION FAILED — manual reconciliation required: "
+                            + "ticketTypeId={}, qty={}, reason={}",
+                    ticketTypeId, quantity, compensationEx.getMessage());
+        }
+    }
+
+    /**
+     * Loads available_stock from DB and writes it to Redis on cache miss.
+     *
+     * Concurrent cache misses are safe — both threads write the same committed
+     * DB value; last-writer-wins is harmless at this point.
      */
     private void loadInventoryIntoRedis(Long ticketTypeId) {
         Inventory inventory = inventoryRepository.findByTicketTypeId(ticketTypeId)
@@ -159,16 +231,10 @@ public class RedisInventoryAdapter implements InventoryPort {
 
     /**
      * Interprets the Lua return value after the initial call or cache-miss retry.
-     *
-     * A -1 after retry means the key vanished between SET and GET — extremely
-     * rare (e.g. maxmemory eviction). The outer catch block in deductStock()
-     * will NOT catch this because it is thrown as a plain RuntimeException,
-     * not a RedisException. It surfaces as an internal error so the operator
-     * can investigate rather than silently degrading.
      */
     private void handleDeductResult(Long result, Long ticketTypeId) {
         if (Long.valueOf(1L).equals(result)) {
-            log.info("[RedisInventory] Deducted: ticketTypeId={}", ticketTypeId);
+            log.info("[RedisInventory] Lua deduction succeeded: ticketTypeId={}", ticketTypeId);
             return;
         }
 
@@ -177,8 +243,8 @@ public class RedisInventoryAdapter implements InventoryPort {
         }
 
         if (Long.valueOf(-1L).equals(result)) {
-            // Key evicted immediately after SET — treat as hard failure, not fallback.
-            // If this appears in logs, check Redis maxmemory-policy configuration.
+            // Key evicted immediately after lazy-load SET — extremely rare.
+            // Check Redis maxmemory-policy if this appears in production logs.
             throw new IllegalStateException(
                     "[RedisInventory] Key evicted immediately after lazy-load: "
                             + "ticketTypeId=" + ticketTypeId
