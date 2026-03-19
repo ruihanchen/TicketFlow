@@ -7,11 +7,13 @@ spring:
       #   200 threads × 2 connections per thread = 400 connections max
       #   (outer @Transactional in OrderService + REQUIRES_NEW in RedisInventoryAdapter)
       #   420 = 400 needed + 20 buffer for background threads
-      #
-      # Phase 1 used 150 (sized for IdempotencyTest: 50 threads × 2 = 100).
-      # Phase 2 Redis Lua eliminates INVENTORY_LOCK_FAILED staggering — all 200
-      # threads hit the DB guard write simultaneously, requiring the larger pool.
       maximum-pool-size: 420
+
+  kafka:
+    consumer:
+      # Earliest offset ensures the test consumer reads messages produced
+      # during the same test run, even if the consumer starts after the producer.
+      auto-offset-reset: earliest
 
   jpa:
     show-sql: false

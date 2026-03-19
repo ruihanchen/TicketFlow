@@ -20,23 +20,40 @@ spring:
 
   data:
     redis:
-      # Override via REDIS_HOST / REDIS_PORT env vars in Docker or staging.
-      # Defaults to localhost for local development.
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-      # Fail fast on unavailable Redis — 2s is enough for a local/Docker hop.
-      # Without this, a dead Redis blocks each request for the default 60s timeout,
-      # making the fallback path feel like a hang rather than a graceful degradation.
       timeout: 2000ms
       lettuce:
         pool:
-          # Size the pool relative to the HikariCP pool (10).
-          # Redis ops are faster than DB ops, so fewer connections suffice.
           max-active: 8
           max-idle: 4
           min-idle: 1
-          # Don't queue indefinitely — surface back-pressure quickly.
           max-wait: 500ms
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # JSON serializer for both key and value.
+      # Type header is included so the consumer can deserialize without
+      # knowing the concrete class at configuration time.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: true
+    consumer:
+      group-id: ticketflow-order-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        # Trust all packages so JsonDeserializer can reconstruct event objects.
+        # In Phase 3 with separate services, this should be tightened to the
+        # specific event package to prevent deserialization of arbitrary classes.
+        spring.json.trusted.packages: "com.chendev.ticketflow.*"
+      # Manual commit offset: consumer explicitly acknowledges after processing.
+      # auto-commit would acknowledge before processing completes — if the consumer
+      # crashes mid-processing, the message is lost and inventory never restored.
+      enable-auto-commit: false
 
   jpa:
     hibernate:
@@ -44,7 +61,6 @@ spring:
     show-sql: false
     properties:
       hibernate:
-#        dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
     open-in-view: false
 

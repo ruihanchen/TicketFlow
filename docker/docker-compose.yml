@@ -21,17 +21,40 @@ services:
     container_name: ticketflow-redis
     ports:
       - "6379:6379"
-    # redis-server --save "" --appendonly no:
-    #   Disables both RDB snapshots and AOF persistence for local development.
-    #   Redis is a cache layer — we treat it as ephemeral. Persistence adds
-    #   disk I/O with no benefit in a dev/test environment.
-    #   Production deployments should re-enable AOF or use a managed Redis service.
+    # Persistence disabled for local development — Redis is a cache layer.
     command: redis-server --save "" --appendonly no
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: ticketflow-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode: Kafka without Zookeeper.
+      # Single-node cluster — sufficient for local development and integration tests.
+      # Production deployments should use a 3-node cluster for fault tolerance.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: [ "CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   app:
     build:
@@ -46,10 +69,13 @@ services:
       SPRING_DATASOURCE_PASSWORD: postgres
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
 
 volumes:

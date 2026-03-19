@@ -33,24 +33,24 @@
         </dependency>
 
         <!-- Redis -->
-        <!--
-            spring-boot-starter-data-redis pulls in Lettuce (the default client).
-            Lettuce connects lazily — if Redis is unavailable at startup, the app
-            still starts. Connection failure surfaces only when Redis is first used,
-            allowing our fallback path in RedisInventoryAdapter to handle it.
-        -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
-        <!--
-            commons-pool2 is required to enable Lettuce connection pooling.
-            Without this on the classpath, the lettuce.pool config in
-            application.yml is silently ignored — a subtle runtime surprise.
-        -->
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-pool2</artifactId>
+        </dependency>
+
+        <!-- Kafka -->
+        <!--
+            spring-kafka provides KafkaTemplate (producer) and @KafkaListener (consumer).
+            Like Lettuce for Redis, the Kafka client connects lazily — the app starts
+            even if Kafka is temporarily unavailable, allowing our fallback paths to engage.
+        -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
         </dependency>
 
         <!-- Security -->
@@ -102,6 +102,11 @@
             <artifactId>spring-security-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
 
         <!-- Testcontainers -->
         <dependency>
@@ -117,6 +122,16 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            Testcontainers Kafka module starts a real Kafka broker in Docker for
+            integration tests. This ensures consumer/producer behaviour is tested
+            against the actual Kafka wire protocol, not a mock.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
             <scope>test</scope>
         </dependency>
 
