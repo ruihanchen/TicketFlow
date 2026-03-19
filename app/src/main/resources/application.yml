@@ -33,9 +33,6 @@ spring:
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
-      # JSON serializer for both key and value.
-      # Type header is included so the consumer can deserialize without
-      # knowing the concrete class at configuration time.
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       properties:
@@ -46,14 +43,15 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
-        # Trust all packages so JsonDeserializer can reconstruct event objects.
-        # In Phase 3 with separate services, this should be tightened to the
-        # specific event package to prevent deserialization of arbitrary classes.
         spring.json.trusted.packages: "com.chendev.ticketflow.*"
-      # Manual commit offset: consumer explicitly acknowledges after processing.
-      # auto-commit would acknowledge before processing completes — if the consumer
-      # crashes mid-processing, the message is lost and inventory never restored.
+      # Manual commit: consumer explicitly ACKs after successful processing.
+      # auto-commit would ACK before processing — message loss on consumer crash.
       enable-auto-commit: false
+      # Backpressure: limit messages pulled per poll cycle.
+      # Prevents a large Kafka backlog from flooding the DB connection pool
+      # when the consumer restarts after a sustained cancellation spike.
+      # At 50 records/poll × 2 DB calls (Redis + DB) = 100 DB operations max per cycle.
+      max-poll-records: 50
 
   jpa:
     hibernate:
@@ -74,6 +72,14 @@ server:
 jwt:
   secret: ${JWT_SECRET:local-dev-secret-key-change-in-production-min-32-chars}
   expiration-ms: 86400000
+
+ticketflow:
+  kafka:
+    topics:
+      order-cancelled: order.cancelled
+      # DLQ topic follows Spring Kafka's default naming convention: {topic}.dlq
+      # Messages exhausting retry attempts in KafkaConsumerConfig are published here.
+      order-cancelled-dlq: order.cancelled.dlq
 
 logging:
   level:

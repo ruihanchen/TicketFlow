@@ -34,6 +34,8 @@ public class RedisConfig {
     /**
      * Atomic inventory release script.
      * Returns: 1 (success), 0 (key absent — Redis restarted).
+     * Used by RedisInventoryAdapter for synchronous release paths
+     * (compensation, direct cancel).
      * See: resources/scripts/release_stock.lua
      */
     @Bean
@@ -41,6 +43,20 @@ public class RedisConfig {
         return RedisScript.of(
                 new ClassPathResource("scripts/release_stock.lua"),
                 Long.class
+        );
+    }
+
+    /**
+     * Atomic idempotent inventory release script for Kafka consumer.
+     * Combines idempotency check + stock increment in one Redis command.
+     * Returns: "OK" | "DUPLICATE" | "CACHE_MISS".
+     * See: resources/scripts/release_stock_idempotent.lua
+     */
+    @Bean
+    public RedisScript<String> releaseStockIdempotentScript() {
+        return RedisScript.of(
+                new ClassPathResource("scripts/release_stock_idempotent.lua"),
+                String.class
         );
     }
 }

@@ -21,21 +21,18 @@ import java.util.Optional;
 @RequiredArgsConstructor
 public class RedisInventoryManager {
 
-    // Key format is defined here, once, as the single source of truth.
-    // RedisInventoryAdapter and the reconciliation job both call inventoryKey()
-    // rather than constructing the key string themselves.
-    private static final String KEY_PREFIX = "inventory:ticketType:";
+    private static final String INVENTORY_KEY_PREFIX        = "inventory:ticketType:";
+    private static final String KAFKA_CONSUMED_PREFIX       = "kafka:consumed:";
+    private static final long   KAFKA_IDEMPOTENCY_TTL_SECS  = 86400L; // 24h
 
-    private final StringRedisTemplate redisTemplate;
-    private final RedisScript<Long> deductStockScript;
-    private final RedisScript<Long> releaseStockScript;
+    private final StringRedisTemplate        redisTemplate;
+    private final RedisScript<Long>          deductStockScript;
+    private final RedisScript<Long>          releaseStockScript;
+    private final RedisScript<String>        releaseStockIdempotentScript;
 
     /**
      * Executes the atomic deduct_stock Lua script.
-     *
-     * @return 1L  — success
-     *         0L  — insufficient stock
-     *        -1L  — cache miss (key absent)
+     * Returns: 1 (success), 0 (insufficient stock), -1 (cache miss).
      */
     public Long deductStock(Long ticketTypeId, int quantity) {
         return redisTemplate.execute(
@@ -47,9 +44,7 @@ public class RedisInventoryManager {
 
     /**
      * Executes the atomic release_stock Lua script.
-     *
-     * @return 1L — success
-     *         0L — key absent (Redis restarted, reconciliation job will sync)
+     * Returns: 1 (success), 0 (key absent — Redis restarted).
      */
     public Long releaseStock(Long ticketTypeId, int quantity) {
         return redisTemplate.execute(
@@ -60,28 +55,36 @@ public class RedisInventoryManager {
     }
 
     /**
-     * Reads the current stock value from Redis.
-     * Returns empty if the key is absent (cache miss).
+     * Idempotent release for Kafka consumer — combines idempotency check,
+     * INCRBY, and SETEX in one atomic Lua command.
+     *
+     * Returns "OK" on first processing, "DUPLICATE" if already processed,
+     * "CACHE_MISS" if the inventory key is absent (Redis restart/eviction).
+     * Caller handles each case; see OrderCancelledConsumer.
      */
+    public String releaseStockIdempotent(String messageId, Long ticketTypeId, int quantity) {
+        return redisTemplate.execute(
+                releaseStockIdempotentScript,
+                List.of(kafkaConsumedKey(messageId), inventoryKey(ticketTypeId)),
+                String.valueOf(quantity),
+                String.valueOf(KAFKA_IDEMPOTENCY_TTL_SECS)
+        );
+    }
+
     public Optional<Integer> getStock(Long ticketTypeId) {
         String value = redisTemplate.opsForValue().get(inventoryKey(ticketTypeId));
         return Optional.ofNullable(value).map(Integer::parseInt);
     }
 
-    /**
-     * Writes a stock value directly to Redis.
-     * Used by lazy-load (cache miss recovery) and the reconciliation job.
-     */
     public void setStock(Long ticketTypeId, int stock) {
         redisTemplate.opsForValue().set(inventoryKey(ticketTypeId), String.valueOf(stock));
     }
 
-    /**
-     * Returns the Redis key for a given ticket type.
-     * Exposed as a static method so callers (e.g. reconciliation job)
-     * can construct keys without holding a reference to this bean.
-     */
     public static String inventoryKey(Long ticketTypeId) {
-        return KEY_PREFIX + ticketTypeId;
+        return INVENTORY_KEY_PREFIX + ticketTypeId;
+    }
+
+    public static String kafkaConsumedKey(String messageId) {
+        return KAFKA_CONSUMED_PREFIX + messageId;
     }
 }
