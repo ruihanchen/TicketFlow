@@ -43,14 +43,11 @@ spring:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
       properties:
+        # Phase 3: tighten to specific event package when services split
         spring.json.trusted.packages: "com.chendev.ticketflow.*"
-      # Manual commit: consumer explicitly ACKs after successful processing.
-      # auto-commit would ACK before processing — message loss on consumer crash.
-      enable-auto-commit: false
-      # Backpressure: limit messages pulled per poll cycle.
-      # Prevents a large Kafka backlog from flooding the DB connection pool
-      # when the consumer restarts after a sustained cancellation spike.
-      # At 50 records/poll × 2 DB calls (Redis + DB) = 100 DB operations max per cycle.
+      enable-auto-commit: false  # manual ACK — prevents message loss on consumer crash
+      # 50 records/poll × 2 ops (Redis + DB) = 100 DB operations max per cycle.
+      # Caps DB load when consumer restarts against a cancellation backlog.
       max-poll-records: 50
 
   jpa:
@@ -66,8 +63,12 @@ spring:
     default-property-inclusion: non_null
     time-zone: UTC
 
+  lifecycle:
+    timeout-per-shutdown-phase: 30s  # wait for in-flight processing on SIGTERM
+
 server:
   port: 8080
+  shutdown: graceful  # required for K8s rolling deploys — prevents mid-flight ACK loss
 
 jwt:
   secret: ${JWT_SECRET:local-dev-secret-key-change-in-production-min-32-chars}
@@ -77,9 +78,11 @@ ticketflow:
   kafka:
     topics:
       order-cancelled: order.cancelled
-      # DLQ topic follows Spring Kafka's default naming convention: {topic}.dlq
-      # Messages exhausting retry attempts in KafkaConsumerConfig are published here.
-      order-cancelled-dlq: order.cancelled.dlq
+      order-cancelled-dlq: order.cancelled.dlq  # Spring Kafka default: {topic}.dlq
+  timeout:
+    fixed-delay: 60000
+  reconciliation:
+    fixed-delay: 300000
 
 logging:
   level:
