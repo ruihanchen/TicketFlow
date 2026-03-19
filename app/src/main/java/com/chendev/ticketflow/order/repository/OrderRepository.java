@@ -19,14 +19,25 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     Optional<Order> findByRequestId(String requestId);
 
-    // Check idempotency key before creating order
     boolean existsByRequestId(String requestId);
 
-    // User's order history — paginated
     Page<Order> findByUserIdOrderByCreatedAtDesc(Long userId, Pageable pageable);
 
-    // Finds expired unpaid orders for the timeout cancellation job
-    // Only scans CREATED and PAYING orders — terminal states are excluded
+    // Paginated overload — used by OrderTimeoutService in production.
+    // Limits each polling cycle to a fixed batch size (e.g. 100) to prevent OOM
+    // when a flash sale produces thousands of simultaneous expired orders.
+    // Prefer this overload in all scheduled jobs.
+    @Query("""
+            SELECT o FROM Order o
+            WHERE o.status IN :statuses
+            AND o.expiredAt < :now
+            """)
+    List<Order> findExpiredOrders(List<OrderStatus> statuses, LocalDateTime now,
+                                  Pageable pageable);
+
+    // Unbounded overload — retained for tests that need deterministic full-scan.
+    // Do NOT use in production scheduled jobs: loading an unbounded result set
+    // into a List triggers OOM when expired order counts are large.
     @Query("""
             SELECT o FROM Order o
             WHERE o.status IN :statuses

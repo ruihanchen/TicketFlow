@@ -9,6 +9,7 @@ import com.chendev.ticketflow.event.repository.TicketTypeRepository;
 import com.chendev.ticketflow.order.dto.CreateOrderRequest;
 import com.chendev.ticketflow.order.dto.OrderResponse;
 import com.chendev.ticketflow.order.entity.Order;
+import com.chendev.ticketflow.order.event.OrderCancelledEvent;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.statemachine.OrderEvent;
@@ -16,6 +17,7 @@ import com.chendev.ticketflow.order.statemachine.OrderStateMachine;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Pageable;
@@ -31,32 +33,25 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class OrderService {
 
-    private final OrderRepository      orderRepository;
-    private final TicketTypeRepository ticketTypeRepository;
-    private final EventRepository      eventRepository;
-    private final InventoryPort        inventoryPort;
-    private final OrderStateMachine    orderStateMachine;
-    private final StringRedisTemplate  redisTemplate;
+    private final OrderRepository           orderRepository;
+    private final TicketTypeRepository      ticketTypeRepository;
+    private final EventRepository           eventRepository;
+    private final InventoryPort             inventoryPort;
+    private final OrderStateMachine         orderStateMachine;
+    private final StringRedisTemplate       redisTemplate;
+    private final ApplicationEventPublisher eventPublisher;
 
     // Self-injection via @Lazy to route doCreateOrder() through the Spring proxy.
     // Direct this.doCreateOrder() bypasses the proxy — @Transactional has no effect,
-    // no Hibernate Session is opened, and lazy associations throw LazyInitializationException.
+    // no Hibernate Session is opened, lazy associations throw LazyInitializationException.
     @Lazy
     @Autowired
     private OrderService self;
 
     private static final String   IDEMPOTENCY_KEY_PREFIX = "idempotency:";
-
-    // PROCESSING TTL: short — in-flight signal only.
-    // If JVM crashes before cleanup, key expires in 30s so the user can retry
-    // rather than being permanently locked out.
-    private static final Duration PROCESSING_TTL = Duration.ofSeconds(30);
-
-    // Completed TTL: long — covers the user's reasonable retry window.
-    // A requestId older than 24h will not produce a duplicate order in practice.
-    private static final Duration COMPLETED_TTL = Duration.ofHours(24);
-
-    private static final String PROCESSING = "PROCESSING";
+    private static final Duration PROCESSING_TTL         = Duration.ofSeconds(30);
+    private static final Duration COMPLETED_TTL          = Duration.ofHours(24);
+    private static final String   PROCESSING             = "PROCESSING";
 
     /**
      * Creates an order idempotently.
@@ -64,22 +59,14 @@ public class OrderService {
      * NOT annotated with @Transactional. Redis idempotency check runs before
      * any DB transaction is opened. DB connections are only acquired inside
      * doCreateOrder(), preventing connection pool exhaustion during Redis I/O.
-     *
-     * Why no @Transactional here:
-     * Holding a HikariCP connection during checkRedisIdempotency() (a network call
-     * to Redis) wastes a connection slot. Under high concurrency, this reproduces
-     * the connection pool exhaustion we hit in Step 1-H. The connection is acquired
-     * only when doCreateOrder() actually needs to write to the DB.
      */
     public OrderResponse createOrder(Long userId, CreateOrderRequest request) {
 
-        // ── Phase 1: Redis idempotency check (outside DB transaction) ─────────
         OrderResponse cached = checkRedisIdempotency(request.getRequestId());
         if (cached != null) {
             return cached;
         }
 
-        // ── Phase 2: Core order creation (inside DB transaction via proxy) ────
         try {
             OrderResponse response = self.doCreateOrder(userId, request);
             markIdempotencyCompleted(request.getRequestId(), response.getOrderNo());
@@ -113,14 +100,12 @@ public class OrderService {
     }
 
     /**
-     * Core order creation logic. Must be public so the Spring proxy can
-     * intercept it for @Transactional. Called via self.doCreateOrder().
+     * Core order creation. Must be public so the Spring proxy intercepts
+     * @Transactional. Called via self.doCreateOrder().
      */
     @Transactional(noRollbackFor = BizException.class)
     public OrderResponse doCreateOrder(Long userId, CreateOrderRequest request) {
 
-        // DB fallback idempotency check — active when Redis was unavailable
-        // and the SETNX fast path was skipped.
         if (orderRepository.existsByRequestId(request.getRequestId())) {
             log.info("[Order] Duplicate requestId detected via DB check: {}",
                     request.getRequestId());
@@ -139,7 +124,6 @@ public class OrderService {
                     "Event is not currently on sale");
         }
 
-        // No pre-check (hasSufficientStock) — separate check introduces TOCTOU race.
         inventoryPort.deductStock(request.getTicketTypeId(), request.getQuantity());
 
         try {
@@ -171,17 +155,34 @@ public class OrderService {
         }
     }
 
+    /**
+     * User-initiated cancellation.
+     *
+     * Phase 2: inventory is restored asynchronously via Kafka.
+     * OrderCancelledEvent is published inside the transaction.
+     * @TransactionalEventListener(AFTER_COMMIT) in OrderCancelledKafkaPublisher
+     * forwards it to Kafka only after the DB commit succeeds — no ghost restores.
+     */
     @Transactional
     public OrderResponse cancelOrder(String orderNo, Long userId) {
         Order order = findOrderByNo(orderNo);
+
         if (!order.getUserId().equals(userId)) {
             throw BizException.of(ResultCode.ORDER_CANCEL_NOT_ALLOWED,
                     "You are not authorized to cancel this order");
         }
+
         orderStateMachine.handleEvent(order, OrderEvent.CANCEL_BY_USER,
                 "Cancelled by user");
-        inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
         orderRepository.save(order);
+
+        eventPublisher.publishEvent(OrderCancelledEvent.of(
+                order.getOrderNo(),
+                order.getTicketTypeId(),
+                order.getQuantity(),
+                "Cancelled by user"
+        ));
+
         log.info("[Order] Cancelled by user: orderNo={}, userId={}", orderNo, userId);
         return OrderResponse.from(order);
     }
@@ -189,6 +190,7 @@ public class OrderService {
     @Transactional
     public OrderResponse initiatePayment(String orderNo, Long userId) {
         Order order = findOrderByNo(orderNo);
+
         if (!order.getUserId().equals(userId)) {
             throw BizException.of(ResultCode.ORDER_STATUS_INVALID,
                     "You are not authorized to pay this order");
@@ -197,9 +199,11 @@ public class OrderService {
             throw BizException.of(ResultCode.ORDER_EXPIRED,
                     "Order has expired, please create a new order");
         }
+
         orderStateMachine.handleEvent(order, OrderEvent.INITIATE_PAYMENT,
                 "Payment initiated by user");
         orderRepository.save(order);
+
         log.info("[Order] Payment initiated: orderNo={}", orderNo);
         return OrderResponse.from(order);
     }
@@ -207,11 +211,13 @@ public class OrderService {
     @Transactional
     public OrderResponse confirmPayment(String orderNo) {
         Order order = findOrderByNo(orderNo);
+
         orderStateMachine.handleEvent(order, OrderEvent.PAYMENT_SUCCESS,
                 "Payment confirmed");
         orderStateMachine.handleEvent(order, OrderEvent.CONFIRM_TICKET,
                 "Ticket confirmed");
         orderRepository.save(order);
+
         log.info("[Order] Payment confirmed: orderNo={}", orderNo);
         return OrderResponse.from(order);
     }
@@ -234,39 +240,38 @@ public class OrderService {
         );
     }
 
+    /**
+     * System-initiated cancellation (timeout).
+     *
+     * Accepts orderNo rather than an Order entity. This is intentional:
+     * OrderTimeoutService loads expired Orders in its own (non-transactional)
+     * context, making them detached entities. Passing a detached entity whose
+     * lazy-loaded statusHistory collection is uninitialized would throw
+     * LazyInitializationException when transitionTo() tries to add to that
+     * collection. Loading fresh inside this @Transactional ensures the entity
+     * is attached and all collections can be initialized on demand.
+     *
+     * Inventory release is async via Kafka, same as user cancellation.
+     */
     @Transactional
     public void cancelOrderBySystem(String orderNo) {
         Order order = findOrderByNo(orderNo);
         orderStateMachine.handleEvent(order, OrderEvent.SYSTEM_TIMEOUT,
                 "Cancelled by system timeout");
-        inventoryPort.releaseStock(order.getTicketTypeId(), order.getQuantity());
         orderRepository.save(order);
-        log.info("[Order] Cancelled by system timeout: orderNo={}", orderNo);
+
+        eventPublisher.publishEvent(OrderCancelledEvent.of(
+                order.getOrderNo(),
+                order.getTicketTypeId(),
+                order.getQuantity(),
+                "Cancelled by system timeout"
+        ));
+
+        log.info("[Order] Cancelled by system timeout: orderNo={}", order.getOrderNo());
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    /**
-     * Attempts to claim the idempotency slot via Redis SETNX.
-     *
-     * Returns a cached OrderResponse if this requestId was already processed,
-     * or null if this is a new request that should proceed.
-     *
-     * Concurrency behaviour:
-     *   Concurrent duplicates (simultaneous requests with same requestId):
-     *     - First thread wins SETNX, proceeds to create order.
-     *     - All other threads see PROCESSING and receive IDEMPOTENT_REJECTION (400).
-     *     - This is correct: Fail-Fast preserves Tomcat thread pool capacity.
-     *     - Sleeping while waiting would hold threads captive, causing pool exhaustion.
-     *
-     *   Sequential duplicates (retry after order is complete):
-     *     - Key contains orderNo (COMPLETED_TTL = 24h).
-     *     - Returns cached OrderResponse immediately. Zero DB write. Pure cache hit.
-     *
-     * Two-phase TTL design:
-     *   PROCESSING (30s): short TTL prevents permanent deadlock on JVM crash.
-     *   orderNo    (24h): long TTL serves sequential retries within reasonable window.
-     */
     private OrderResponse checkRedisIdempotency(String requestId) {
         String key = IDEMPOTENCY_KEY_PREFIX + requestId;
         try {
@@ -274,16 +279,12 @@ public class OrderService {
                     .setIfAbsent(key, PROCESSING, PROCESSING_TTL);
 
             if (Boolean.TRUE.equals(acquired)) {
-                return null; // First request — proceed with creation.
+                return null;
             }
 
             String value = redisTemplate.opsForValue().get(key);
 
             if (PROCESSING.equals(value)) {
-                // Another request is in-flight. Fail-Fast: reject immediately.
-                // Sleeping here would hold a Tomcat thread captive for 50-150ms.
-                // Under high concurrency, this exhausts the thread pool and causes
-                // a cascade failure where healthy requests cannot be served.
                 log.info("[Order] Request in-flight, rejecting concurrent duplicate: " +
                         "requestId={}", requestId);
                 throw BizException.of(ResultCode.IDEMPOTENT_REJECTION,
@@ -291,7 +292,6 @@ public class OrderService {
             }
 
             if (value != null) {
-                // Order already created — return cached result. Pure Redis cache hit.
                 log.info("[Order] Idempotency cache hit: requestId={}, orderNo={}",
                         requestId, value);
                 return orderRepository.findByOrderNo(value)
@@ -299,7 +299,6 @@ public class OrderService {
                         .orElse(null);
             }
 
-            // Key expired between SET and GET — treat as new request.
             return null;
 
         } catch (BizException e) {

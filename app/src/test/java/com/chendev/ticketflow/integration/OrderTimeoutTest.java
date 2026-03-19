@@ -9,6 +9,7 @@ import com.chendev.ticketflow.inventory.entity.Inventory;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.dto.CreateOrderRequest;
 import com.chendev.ticketflow.order.entity.Order;
+import com.chendev.ticketflow.order.event.OrderCancelledEvent;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.service.OrderService;
 import com.chendev.ticketflow.order.service.OrderTimeoutService;
@@ -19,6 +20,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.context.event.ApplicationEvents;
+import org.springframework.test.context.event.RecordApplicationEvents;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -30,24 +33,45 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Test 3: Order Timeout Cancellation
  *
  * Validates three correctness invariants of the timeout mechanism:
- *   1. Expired orders  → CANCELLED, inventory fully restored
- *   2. Active orders   → CREATED,   inventory unchanged
- *   3. Running the timeout service twice is idempotent — no double-cancellation,
- *      no double inventory restore
+ *   1. Expired orders  → CANCELLED, OrderCancelledEvent published to Spring context
+ *   2. Active orders   → CREATED,   no event published, inventory unchanged
+ *   3. Running the timeout service twice is idempotent — state machine rejects
+ *      the second attempt; exactly zero events are published on the second run.
  *
- * Design note: we backdate expiredAt rather than sleeping, so the test
- * completes in milliseconds and is fully deterministic.
+ * Phase 2 behaviour (inventory restoration is async):
+ *   cancelOrderBySystem() publishes an OrderCancelledEvent via ApplicationEventPublisher.
+ *   OrderCancelledKafkaPublisher forwards it to Kafka AFTER_COMMIT (@Async).
+ *   The Kafka consumer (Step 3-C) restores inventory asynchronously.
+ *
+ *   These tests verify the cancellation + event publication side only.
+ *   The full async restoration loop is tested in Step 3-D (KafkaConsumerTest).
+ *
+ * Why @RecordApplicationEvents?
+ *   @TransactionalEventListener(@Async) makes Kafka send happen on a background
+ *   thread after commit. Testing the actual Kafka delivery would require waiting
+ *   for async completion — slow and flaky. Instead, we intercept Spring's
+ *   ApplicationEventPublisher bus directly. This is millisecond-fast and 100%
+ *   deterministic: if publishEvent() was called, the event is captured regardless
+ *   of what the listener does with it. The listener's Kafka delivery is tested
+ *   end-to-end in Step 3-D.
+ *
+ * Three-dimensional assertion:
+ *   1. DB state    — order status transitioned correctly
+ *   2. Negative    — stock not synchronously restored (async responsibility)
+ *   3. Positive    — OrderCancelledEvent published exactly once, with correct data
  */
+@RecordApplicationEvents
 class OrderTimeoutTest extends IntegrationTestBase {
 
-    @Autowired private OrderService orderService;
-    @Autowired private OrderTimeoutService orderTimeoutService;
-    @Autowired private OrderRepository orderRepository;
-    @Autowired private InventoryRepository inventoryRepository;
+    @Autowired private OrderService         orderService;
+    @Autowired private OrderTimeoutService  orderTimeoutService;
+    @Autowired private OrderRepository      orderRepository;
+    @Autowired private InventoryRepository  inventoryRepository;
     @Autowired private TicketTypeRepository ticketTypeRepository;
-    @Autowired private EventRepository eventRepository;
-    @Autowired private UserRepository userRepository;
-    @Autowired private PasswordEncoder passwordEncoder;
+    @Autowired private EventRepository      eventRepository;
+    @Autowired private UserRepository       userRepository;
+    @Autowired private PasswordEncoder      passwordEncoder;
+    @Autowired private ApplicationEvents    applicationEvents;
 
     private static final int INITIAL_STOCK = 10;
 
@@ -56,8 +80,7 @@ class OrderTimeoutTest extends IntegrationTestBase {
 
     @BeforeEach
     void setUp() {
-        // Base class @BeforeEach already TRUNCATEs all tables.
-        // We only insert the fixture data needed for this test.
+        // IntegrationTestBase.cleanDatabase() handles TRUNCATE + Redis FLUSHDB.
 
         Event event = Event.create(
                 "Timeout Test Concert",
@@ -71,10 +94,7 @@ class OrderTimeoutTest extends IntegrationTestBase {
         event = eventRepository.save(event);
 
         TicketType ticketType = TicketType.create(
-                event,
-                "Standard",
-                new BigDecimal("50.00"),
-                INITIAL_STOCK
+                event, "Standard", new BigDecimal("50.00"), INITIAL_STOCK
         );
         ticketType = ticketTypeRepository.save(ticketType);
         ticketTypeId = ticketType.getId();
@@ -89,16 +109,19 @@ class OrderTimeoutTest extends IntegrationTestBase {
         userId = userRepository.save(user).getId();
     }
 
+    /**
+     * Three-dimensional verification:
+     *   1. DB: expired order transitions to CANCELLED.
+     *   2. Negative: stock not synchronously restored (async, consumer in Step 3-C).
+     *   3. Positive: exactly one OrderCancelledEvent published with correct orderNo.
+     */
     @Test
-    void expiredOrder_isAutoCancelled_andInventoryIsRestored() {
+    void expiredOrder_isAutoCancelled_andKafkaEventPublished() {
         // ── Arrange ───────────────────────────────────────────────────────────
 
-        // Create a normal order through the service layer.
-        // available_stock is now INITIAL_STOCK - 1.
         orderService.createOrder(userId,
                 CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()));
 
-        // Sanity check: stock was deducted before we manipulate expiry.
         int stockAfterOrder = inventoryRepository
                 .findByTicketTypeId(ticketTypeId).orElseThrow()
                 .getAvailableStock();
@@ -106,54 +129,78 @@ class OrderTimeoutTest extends IntegrationTestBase {
                 .as("Stock must be deducted immediately after order creation")
                 .isEqualTo(INITIAL_STOCK - 1);
 
-        // Backdate expiredAt to simulate 15 minutes having elapsed.
-        // We manipulate the DB directly rather than sleeping for 15 minutes.
         Order order = orderRepository.findAll().get(0);
-        order.expireNow(); // sets expiredAt = now - 1 second
+        order.expireNow();
         orderRepository.save(order);
 
         // ── Act ───────────────────────────────────────────────────────────────
 
         orderTimeoutService.cancelExpiredOrders();
 
-        // ── Assert ────────────────────────────────────────────────────────────
+        // ── Assert 1: DB state ────────────────────────────────────────────────
 
         Order cancelledOrder = orderRepository.findById(order.getId()).orElseThrow();
-
         assertThat(cancelledOrder.getStatus())
                 .as("Expired order must be CANCELLED by the timeout service")
                 .isEqualTo(OrderStatus.CANCELLED);
 
+        // ── Assert 2: Negative — no synchronous stock restore ─────────────────
+
         int stockAfterCancellation = inventoryRepository
                 .findByTicketTypeId(ticketTypeId).orElseThrow()
                 .getAvailableStock();
-
         assertThat(stockAfterCancellation)
-                .as("Inventory must be fully restored after timeout cancellation")
-                .isEqualTo(INITIAL_STOCK);
+                .as("Phase 2: inventory restored async by consumer (Step 3-C). " +
+                        "Stock must remain INITIAL_STOCK - 1 immediately after cancellation.")
+                .isEqualTo(INITIAL_STOCK - 1);
+
+        // ── Assert 3: Positive — event published exactly once ─────────────────
+        // @RecordApplicationEvents captures events published to Spring's
+        // ApplicationEventPublisher synchronously, before the @Async listener runs.
+        // This is the contract verification: cancelOrderBySystem() must publish
+        // exactly one OrderCancelledEvent carrying the correct orderNo.
+
+        long eventCount = applicationEvents.stream(OrderCancelledEvent.class).count();
+        assertThat(eventCount)
+                .as("Exactly one OrderCancelledEvent must be published to the " +
+                        "Spring ApplicationContext — the async Kafka publisher listens for this")
+                .isEqualTo(1);
+
+        OrderCancelledEvent publishedEvent = applicationEvents
+                .stream(OrderCancelledEvent.class)
+                .findFirst()
+                .orElseThrow();
+        assertThat(publishedEvent.orderNo())
+                .as("Published event must carry the correct orderNo")
+                .isEqualTo(cancelledOrder.getOrderNo());
+        assertThat(publishedEvent.ticketTypeId())
+                .as("Published event must carry the correct ticketTypeId")
+                .isEqualTo(ticketTypeId);
+        assertThat(publishedEvent.quantity())
+                .as("Published event must carry the correct quantity")
+                .isEqualTo(1);
 
         System.out.printf(
-                "%n[Timeout Test] expiredOrder_cancelled: status=%s, stock=%d%n",
-                cancelledOrder.getStatus(), stockAfterCancellation);
+                "%n[Timeout Test] 3D verified: status=%s, stock=%d, " +
+                        "events=%d, orderNo=%s%n",
+                cancelledOrder.getStatus(), stockAfterCancellation,
+                eventCount, publishedEvent.orderNo());
     }
 
     @Test
     void activeOrder_isNotCancelled_byTimeoutService() {
         // ── Arrange ───────────────────────────────────────────────────────────
 
-        // Create an order with default expiredAt = now + 15 min. It has NOT expired.
         orderService.createOrder(userId,
                 CreateOrderRequest.forTest(ticketTypeId, 1, UUID.randomUUID().toString()));
 
         // ── Act ───────────────────────────────────────────────────────────────
 
-        // Run the timeout service — it must leave this active order untouched.
         orderTimeoutService.cancelExpiredOrders();
 
         // ── Assert ────────────────────────────────────────────────────────────
 
         Order activeOrder = orderRepository.findAll().get(0);
-
         assertThat(activeOrder.getStatus())
                 .as("Non-expired order must remain CREATED after timeout service runs")
                 .isEqualTo(OrderStatus.CREATED);
@@ -161,18 +208,32 @@ class OrderTimeoutTest extends IntegrationTestBase {
         int stock = inventoryRepository
                 .findByTicketTypeId(ticketTypeId).orElseThrow()
                 .getAvailableStock();
-
         assertThat(stock)
-                .as("Inventory must not be restored for a non-expired order")
+                .as("Inventory must not be touched for a non-expired order")
                 .isEqualTo(INITIAL_STOCK - 1);
 
+        long eventCount = applicationEvents.stream(OrderCancelledEvent.class).count();
+        assertThat(eventCount)
+                .as("No OrderCancelledEvent must be published for a non-expired order")
+                .isEqualTo(0);
+
         System.out.printf(
-                "%n[Timeout Test] activeOrder_preserved: status=%s, stock=%d%n",
-                activeOrder.getStatus(), stock);
+                "%n[Timeout Test] activeOrder_preserved: status=%s, stock=%d, events=%d%n",
+                activeOrder.getStatus(), stock, eventCount);
     }
 
+    /**
+     * Idempotency verification — three dimensions:
+     *   1. DB: exactly one CANCELLED order after two runs.
+     *   2. Events from first run: exactly one OrderCancelledEvent.
+     *   3. Events from second run: exactly zero (state machine blocked the transition).
+     *
+     * The zero-event assertion on the second run proves the consumer will not
+     * receive a duplicate message — preventing double inventory restoration.
+     */
     @Test
-    void timeoutService_isIdempotent_runningTwiceHasNoAdditionalEffect() {
+    void timeoutService_isIdempotent_runningTwiceHasNoAdditionalEffect()
+            throws InterruptedException {
         // ── Arrange ───────────────────────────────────────────────────────────
 
         orderService.createOrder(userId,
@@ -182,15 +243,20 @@ class OrderTimeoutTest extends IntegrationTestBase {
         order.expireNow();
         orderRepository.save(order);
 
-        // ── Act ───────────────────────────────────────────────────────────────
+        // ── Act: first run ────────────────────────────────────────────────────
 
-        // First run: cancels the order and restores inventory.
         orderTimeoutService.cancelExpiredOrders();
 
-        // Second run: order is already CANCELLED.
-        // The state machine must reject the SYSTEM_TIMEOUT event for a CANCELLED
-        // order, which cancelOrderBySystem() catches and logs as a warning.
-        // Inventory must NOT be released a second time.
+        long eventsAfterFirstRun = applicationEvents.stream(OrderCancelledEvent.class).count();
+        assertThat(eventsAfterFirstRun)
+                .as("First run must publish exactly one OrderCancelledEvent")
+                .isEqualTo(1);
+
+        // Clear recorded events so the second run's output is isolated.
+        applicationEvents.clear();
+
+        // ── Act: second run ───────────────────────────────────────────────────
+
         orderTimeoutService.cancelExpiredOrders();
 
         // ── Assert ────────────────────────────────────────────────────────────
@@ -198,21 +264,27 @@ class OrderTimeoutTest extends IntegrationTestBase {
         long cancelledCount = orderRepository.findAll().stream()
                 .filter(o -> o.getStatus() == OrderStatus.CANCELLED)
                 .count();
-
         assertThat(cancelledCount)
-                .as("Exactly one CANCELLED order — no state duplication")
+                .as("Exactly one CANCELLED order — state machine rejects duplicate transitions")
                 .isEqualTo(1);
 
         int stock = inventoryRepository
                 .findByTicketTypeId(ticketTypeId).orElseThrow()
                 .getAvailableStock();
-
         assertThat(stock)
-                .as("Inventory restored exactly once — no double-restore")
-                .isEqualTo(INITIAL_STOCK);
+                .as("Phase 2: stock unchanged — async consumer has not run yet")
+                .isEqualTo(INITIAL_STOCK - 1);
+
+        long eventsAfterSecondRun = applicationEvents.stream(OrderCancelledEvent.class).count();
+        assertThat(eventsAfterSecondRun)
+                .as("Second run must publish ZERO events — state machine blocked the " +
+                        "SYSTEM_TIMEOUT transition for an already-CANCELLED order. " +
+                        "This prevents duplicate Kafka messages and double inventory restore.")
+                .isEqualTo(0);
 
         System.out.printf(
-                "%n[Timeout Test] idempotency_verified: cancelled=%d, stock=%d%n",
-                cancelledCount, stock);
+                "%n[Timeout Test] idempotency verified: cancelled=%d, stock=%d, " +
+                        "events_run1=%d, events_run2=%d%n",
+                cancelledCount, stock, eventsAfterFirstRun, eventsAfterSecondRun);
     }
 }
