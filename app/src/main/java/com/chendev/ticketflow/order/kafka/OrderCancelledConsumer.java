@@ -12,17 +12,16 @@ import org.springframework.stereotype.Component;
 /**
  * Restores inventory when an order is cancelled.
  *
- * Redis-first via release_stock_idempotent.lua (atomic check + INCRBY + SETEX).
- * Covers concurrent redelivery during rebalance — non-atomic would let two
- * instances both pass the idempotency check and double-restore.
+ * Idempotency via release_stock_idempotent.lua (atomic SETNX + INCRBY):
+ *   - OK: Redis already incremented by Lua; only DB needs updating.
+ *     Calls releaseStockDbOnly() — not releaseStock() — to avoid double-INCRBY.
+ *   - DUPLICATE: Redis is guaranteed correct (Lua ran). DB may or may not
+ *     have been updated. We skip DB to avoid double-restore if it did succeed.
+ *     Accepted trade-off: rare under-selling until Reconciler corrects drift.
+ *   - CACHE_MISS: inventory key absent; Lua couldn't increment Redis.
+ *     Call releaseStockDbOnly() — Redis will be rebuilt by Reconciler.
  *
- * DUPLICATE branch deliberately skips the DB write. If we re-called
- * releaseStock() and the previous attempt's DB write had succeeded, we'd
- * over-count inventory — worse than the alternative. Accepting rare under-sell;
- * InventoryReconciler corrects Redis > DB drift within its next cycle (~5 min).
- *
- * TODO (Phase 3): replace AFTER_COMMIT + Reconciler safety net with
- * Transactional Outbox to eliminate the under-sell window entirely.
+ * TODO (Phase 3): Outbox pattern eliminates the DUPLICATE under-sell window.
  */
 @Slf4j
 @Component
@@ -45,26 +44,16 @@ public class OrderCancelledConsumer {
         try {
             processEvent(event, ack);
         } catch (Exception e) {
-            // Log-and-rethrow: adds business context before the exception reaches
-            // DefaultErrorHandler. Without this, ELK logs contain only partition/offset;
-            // engineers must manually reverse-map offsets to business order numbers.
-            // With this, searching "orderNo=TF123456" surfaces the failure instantly.
-            //
-            // CRITICAL: must rethrow. Swallowing the exception here would prevent
-            // DefaultErrorHandler from triggering retry/DLQ — messages silently disappear.
-            log.error("[Consumer] Failed to process OrderCancelledEvent. " +
-                            "orderNo={}, messageId={}, error={}. " +
-                            "Propagating to Kafka ErrorHandler for backoff/DLQ routing.",
+            // Log-and-rethrow: surfaces orderNo + messageId in ELK before
+            // DefaultErrorHandler applies backoff (1s → 4s → 16s) and DLQ routing.
+            log.error("[Consumer] Processing failed. orderNo={}, messageId={}, error={}. " +
+                            "Propagating to Kafka ErrorHandler.",
                     event.orderNo(), event.messageId(), e.getMessage());
             throw e;
         }
     }
 
     private void processEvent(OrderCancelledEvent event, Acknowledgment ack) {
-        // Step 1: atomic Redis operation — idempotency check + inventory release.
-        // RedisSystemException / QueryTimeoutException propagate to the outer catch.
-        // Lettuce command timeout (2000ms, configured in application.yml) ensures
-        // this call fails fast rather than blocking the Kafka poll thread indefinitely.
         String result = redisInventoryManager.releaseStockIdempotent(
                 event.messageId(),
                 event.ticketTypeId(),
@@ -73,60 +62,55 @@ public class OrderCancelledConsumer {
 
         switch (result) {
             case "OK" -> {
-                // First-time processing: Redis inventory restored.
-                // Sync DB to keep Redis and DB consistent.
-                log.info("[Consumer] Redis inventory restored (first-time): " +
+                // Lua already did Redis INCRBY atomically.
+                // Call releaseStockDbOnly() — NOT releaseStock() — to avoid double-INCRBY.
+                log.info("[Consumer] Lua restored Redis. Syncing DB: " +
                                 "orderNo={}, ticketTypeId={}, qty={}",
                         event.orderNo(), event.ticketTypeId(), event.quantity());
 
-                // DB exception propagates to outer catch → log-and-rethrow → retry/DLQ.
-                inventoryPort.releaseStock(event.ticketTypeId(), event.quantity());
-
+                inventoryPort.releaseStockDbOnly(event.ticketTypeId(), event.quantity());
                 ack.acknowledge();
+
                 log.info("[Consumer] ACK sent: orderNo={}, messageId={}",
                         event.orderNo(), event.messageId());
             }
 
             case "DUPLICATE" -> {
-                // messageId already processed by a previous attempt.
+                // Redis is guaranteed correct (Lua ran on first delivery).
+                // DB may or may not be updated — we skip to avoid double-restore.
                 //
-                // KAFKA_DUPLICATE_SKIP — known trade-off (see class Javadoc).
-                // Do NOT call inventoryPort.releaseStock() here.
-                log.warn("[KAFKA_DUPLICATE_SKIP] Duplicate message skipped. " +
-                                "If DB was not updated in the previous attempt, " +
-                                "stock for ticketTypeId={} may be understated until " +
-                                "InventoryReconciler corrects the drift. " +
-                                "orderNo={}, messageId={}",
+                // KAFKA_DUPLICATE_SKIP — accepted trade-off:
+                // If previous attempt's DB write failed, inventory is temporarily
+                // understated until InventoryReconciler corrects Redis > DB drift (~5 min).
+                log.warn("[KAFKA_DUPLICATE_SKIP] Redis guaranteed correct; skipping DB. " +
+                                "If previous DB write failed, stock for ticketTypeId={} is " +
+                                "understated until Reconciler runs. orderNo={}, messageId={}",
                         event.ticketTypeId(), event.orderNo(), event.messageId());
 
                 ack.acknowledge();
             }
 
             case "CACHE_MISS" -> {
-                // Inventory key absent in Redis. Update DB directly.
-                // Reconciler will rebuild Redis cache on next cycle.
+                // Inventory key absent — Lua couldn't increment Redis.
+                // Update DB directly; Reconciler rebuilds Redis on next cycle.
                 log.warn("[Consumer] Redis cache miss for ticketTypeId={}. " +
-                                "Restoring DB directly. Reconciler will rebuild Redis cache. " +
+                                "Updating DB directly; Reconciler will rebuild Redis. " +
                                 "orderNo={}, messageId={}",
                         event.ticketTypeId(), event.orderNo(), event.messageId());
 
-                // DB exception propagates to outer catch → log-and-rethrow → retry/DLQ.
-                inventoryPort.releaseStock(event.ticketTypeId(), event.quantity());
-
+                inventoryPort.releaseStockDbOnly(event.ticketTypeId(), event.quantity());
                 ack.acknowledge();
+
                 log.info("[Consumer] ACK sent (cache-miss path): orderNo={}, messageId={}",
                         event.orderNo(), event.messageId());
             }
 
             default -> {
-                // Unknown Lua return code — defensive catch.
-                // Throw so the error handler routes to DLQ.
-                log.error("[Consumer] Unknown Lua result '{}' for orderNo={}, messageId={}. " +
-                                "Routing to DLQ.",
+                log.error("[Consumer] Unknown Lua result '{}'. Routing to DLQ. " +
+                                "orderNo={}, messageId={}",
                         result, event.orderNo(), event.messageId());
                 throw new IllegalStateException(
-                        "Unknown Lua script result: " + result +
-                                " for messageId=" + event.messageId());
+                        "Unknown Lua result: " + result + " for messageId=" + event.messageId());
             }
         }
     }

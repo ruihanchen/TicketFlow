@@ -1,51 +1,35 @@
 -- release_stock_idempotent.lua
--- Atomically: check consumer idempotency + release inventory in Redis.
+-- Atomic idempotency check + inventory restore for Kafka consumer.
 --
--- Executed by OrderCancelledConsumer to restore inventory when an order
--- is cancelled. Combines the idempotency check and stock increment into a
--- single atomic Redis command, preventing double-restore under concurrent
--- Kafka redelivery (e.g. during consumer rebalance).
+-- Combining SETNX and INCRBY in one Lua command gives a critical guarantee:
+-- if this messageId is ever seen as DUPLICATE, Redis inventory is guaranteed
+-- to have already been incremented. The consumer can safely skip DB-only
+-- work knowing Redis is correct.
 --
--- Key format mirrors deduct_stock.lua / release_stock.lua (String, not Hash).
--- inventory key value is a plain integer string, e.g. "99".
+-- KEYS[1] : idempotency key  "kafka:consumed:{messageId}"
+-- KEYS[2] : inventory key    "inventory:ticketType:{ticketTypeId}"
+-- ARGV[1] : quantity to restore
+-- ARGV[2] : idempotency key TTL in seconds (86400 = 24h)
 --
--- KEYS[1] : idempotency key  e.g. "kafka:consumed:{messageId}"
--- KEYS[2] : inventory key    e.g. "inventory:ticketType:{ticketTypeId}"
--- ARGV[1] : quantity to return (positive integer string)
--- ARGV[2] : idempotency key TTL in seconds (e.g. "86400" for 24 hours)
---
--- Return values (contract shared with RedisInventoryManager):
---   "OK"         : success — Redis inventory incremented, messageId recorded
---   "DUPLICATE"  : messageId already processed; Redis not changed
---   "CACHE_MISS" : inventory key absent in Redis (restart/eviction); skip Redis,
---                  caller must update DB directly and reconciler will rebuild cache
+-- Returns:
+--   "OK"         — first time; Redis incremented, messageId recorded; caller updates DB
+--   "DUPLICATE"  — already processed; Redis guaranteed correct; caller may skip DB
+--   "CACHE_MISS" — inventory key absent (Redis restart/eviction); skip Redis,
+--                  caller updates DB directly; reconciler rebuilds cache
 
--- 1. Idempotency check: has this messageId been processed before?
 if redis.call('EXISTS', KEYS[1]) == 1 then
     return 'DUPLICATE'
 end
 
--- 2. Cache miss guard: inventory key must exist before we increment.
---    Do NOT create the key here with just the returned quantity.
---    That would produce a stale value (e.g. "1") when the real
---    available_stock in DB might be 47.
---    The reconciliation job owns DB → Redis sync.
 local current_str = redis.call('GET', KEYS[2])
 if not current_str then
     return 'CACHE_MISS'
 end
 
--- 3. Increment inventory.
---    No upper-bound check against total_stock here — Redis does not store total.
---    Upper-bound protection is enforced by the DB guard write in InventoryRepository
---    (available_stock + qty <= total_stock) and the CHECK constraint on the column.
+-- Increment inventory and record messageId atomically.
+-- Only one of these two operations can happen: either both succeed or
+-- neither succeeds (Lua executes as a single atomic Redis command).
 redis.call('INCRBY', KEYS[2], tonumber(ARGV[1]))
-
--- 4. Record messageId as processed with TTL.
---    SETEX is atomic with the INCRBY above because Lua executes as a single command.
---    If the JVM crashes after INCRBY but before SETEX, the next retry will not find
---    the idempotency key and will INCRBY again — double-restore in Redis.
---    The reconciliation job detects Redis > DB drift and corrects it.
 redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), 'SUCCESS')
 
 return 'OK'

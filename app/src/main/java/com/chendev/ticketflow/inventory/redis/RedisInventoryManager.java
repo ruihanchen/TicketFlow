@@ -13,22 +13,19 @@ import java.util.Optional;
  *
  * Single responsibility: knows HOW to talk to Redis.
  * Does NOT know what to do with the results — that is RedisInventoryAdapter's job.
- *
- * StringRedisTemplate stores and retrieves stock as plain strings ("42").
- * This matches what the Lua scripts read via redis.call('GET', key).
  */
 @Component
 @RequiredArgsConstructor
 public class RedisInventoryManager {
 
-    private static final String INVENTORY_KEY_PREFIX        = "inventory:ticketType:";
-    private static final String KAFKA_CONSUMED_PREFIX       = "kafka:consumed:";
-    private static final long   KAFKA_IDEMPOTENCY_TTL_SECS  = 86400L; // 24h
+    private static final String INVENTORY_KEY_PREFIX       = "inventory:ticketType:";
+    private static final String KAFKA_CONSUMED_PREFIX      = "kafka:consumed:";
+    private static final long   KAFKA_IDEMPOTENCY_TTL_SECS = 86400L; // 24h
 
-    private final StringRedisTemplate        redisTemplate;
-    private final RedisScript<Long>          deductStockScript;
-    private final RedisScript<Long>          releaseStockScript;
-    private final RedisScript<String>        releaseStockIdempotentScript;
+    private final StringRedisTemplate     redisTemplate;
+    private final RedisScript<Long>       deductStockScript;
+    private final RedisScript<Long>       releaseStockScript;
+    private final RedisScript<String>     releaseStockIdempotentScript;
 
     /**
      * Executes the atomic deduct_stock Lua script.
@@ -55,12 +52,14 @@ public class RedisInventoryManager {
     }
 
     /**
-     * Idempotent release for Kafka consumer — combines idempotency check,
-     * INCRBY, and SETEX in one atomic Lua command.
+     * Atomic idempotency check + Redis inventory restore for Kafka consumer.
      *
-     * Returns "OK" on first processing, "DUPLICATE" if already processed,
-     * "CACHE_MISS" if the inventory key is absent (Redis restart/eviction).
-     * Caller handles each case; see OrderCancelledConsumer.
+     * Combines SETNX + INCRBY + SETEX in one Lua command. This guarantees:
+     * if a subsequent delivery sees DUPLICATE, Redis inventory is definitely
+     * already correct — only DB may be behind.
+     *
+     * Returns "OK" (first time, Redis incremented), "DUPLICATE" (already processed,
+     * Redis guaranteed correct), "CACHE_MISS" (key absent, skip Redis, update DB).
      */
     public String releaseStockIdempotent(String messageId, Long ticketTypeId, int quantity) {
         return redisTemplate.execute(

@@ -21,9 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
  *   1. Phase 1 — sole InventoryPort implementation
  *   2. Phase 2 — fallback when Redis is unavailable
  *
- * In Phase 2, RedisInventoryAdapter (@Primary) delegates here on
- * RedisException. This adapter requires no changes for that role —
- * the Port & Adapter boundary absorbs the technology switch entirely.
+ * In Phase 2, RedisInventoryAdapter (@Primary) delegates here on RedisException.
  */
 @Slf4j
 //@Primary
@@ -33,12 +31,6 @@ public class InventoryAdapter implements InventoryPort {
 
     private final InventoryRepository inventoryRepository;
 
-    // noRollbackFor = BizException.class:
-    // When OptimisticLockingFailureException is caught and re-thrown as BizException,
-    // we do NOT want Spring to mark the shared transaction as rollback-only.
-    // BizException is a handled business condition, not an unrecoverable error.
-    // Without this, the outer createOrder() transaction would be poisoned before
-    // its catch blocks have a chance to execute recovery logic.
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void deductStock(Long ticketTypeId, int quantity) {
@@ -46,14 +38,10 @@ public class InventoryAdapter implements InventoryPort {
         try {
             inventory.deduct(quantity);
             inventoryRepository.save(inventory);
-            inventoryRepository.flush(); // Force immediate SQL execution so that
-            // OptimisticLockException surfaces here,
-            // inside this try-catch, not at commit time.
+            inventoryRepository.flush();
             log.info("[Inventory] Deducted: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
         } catch (OptimisticLockingFailureException e) {
-            // Another transaction updated inventory concurrently.
-            // Surface this as a retryable business exception, not a system error.
             log.warn("[Inventory] Optimistic lock conflict: ticketTypeId={}", ticketTypeId);
             throw BizException.of(ResultCode.INVENTORY_LOCK_FAILED,
                     "High demand — please try again");
@@ -70,10 +58,22 @@ public class InventoryAdapter implements InventoryPort {
             log.info("[Inventory] Released: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
         } catch (OptimisticLockingFailureException e) {
-            log.warn("[Inventory] Optimistic lock conflict on release: ticketTypeId={}", ticketTypeId);
+            log.warn("[Inventory] Optimistic lock conflict on release: ticketTypeId={}",
+                    ticketTypeId);
             throw BizException.of(ResultCode.INVENTORY_LOCK_FAILED,
                     "Failed to release stock — please retry");
         }
+    }
+
+    /**
+     * DB-only release for the Kafka consumer async path.
+     * Lua script already restored Redis atomically; this method only syncs DB.
+     * Identical to releaseStock() in this adapter — Redis is not involved here.
+     */
+    @Override
+    @Transactional
+    public void releaseStockDbOnly(Long ticketTypeId, int quantity) {
+        releaseStock(ticketTypeId, quantity);
     }
 
     @Override
