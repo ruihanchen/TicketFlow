@@ -26,7 +26,7 @@ public abstract class IntegrationTestBase {
                     .withPassword("test")
                     // max_connections must exceed HikariCP pool ceiling (420).
                     // 500 = 420 pool + 80 buffer for Postgres background processes.
-                    .withCommand("postgres -c max_connections=500");
+                    .withCommand("postgres -c max_connections=900");
 
     // ── Redis ─────────────────────────────────────────────────────────────────
 

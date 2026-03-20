@@ -7,13 +7,18 @@ spring:
       #   200 threads × 2 connections per thread = 400 connections max
       #   (outer @Transactional in OrderService + REQUIRES_NEW in RedisInventoryAdapter)
       #   420 = 400 needed + 20 buffer for background threads
-      maximum-pool-size: 420
+      maximum-pool-size: 200
 
   kafka:
     consumer:
       # Earliest offset ensures the test consumer reads messages produced
       # during the same test run, even if the consumer starts after the producer.
       auto-offset-reset: earliest
+      properties:
+        # Trust all packages in test environment — avoids DeserializationException
+        # when JsonDeserializer encounters OrderCancelledEvent from type headers.
+        # Production application.yml already limits this to com.chendev.ticketflow.*
+        spring.json.trusted.packages: "*"
 
   jpa:
     show-sql: false
