@@ -11,6 +11,7 @@ import com.chendev.ticketflow.order.dto.OrderResponse;
 import com.chendev.ticketflow.order.entity.Order;
 import com.chendev.ticketflow.order.event.OrderCancelledEvent;
 import com.chendev.ticketflow.order.port.InventoryPort;
+import com.chendev.ticketflow.order.port.InventoryPort.DeductionResult;
 import com.chendev.ticketflow.order.repository.OrderRepository;
 import com.chendev.ticketflow.order.statemachine.OrderEvent;
 import com.chendev.ticketflow.order.statemachine.OrderStateMachine;
@@ -41,9 +42,6 @@ public class OrderService {
     private final StringRedisTemplate       redisTemplate;
     private final ApplicationEventPublisher eventPublisher;
 
-    // Self-injection via @Lazy to route doCreateOrder() through the Spring proxy.
-    // Direct this.doCreateOrder() bypasses the proxy — @Transactional has no effect,
-    // no Hibernate Session is opened, lazy associations throw LazyInitializationException.
     @Lazy
     @Autowired
     private OrderService self;
@@ -54,25 +52,48 @@ public class OrderService {
     private static final String   PROCESSING             = "PROCESSING";
 
     /**
-     * Creates an order idempotently.
+     * Creates an order using the Transactionless Fast Path.
      *
-     * NOT annotated with @Transactional. Redis idempotency check runs before
-     * any DB transaction is opened. DB connections are only acquired inside
-     * doCreateOrder(), preventing connection pool exhaustion during Redis I/O.
+     * Phase 1 (no DB connection): Redis idempotency check + Redis Lua stock deduction.
+     * Phase 2 (short @Transactional): DB guard write + order insert.
+     *
+     * Rejected requests (stock insufficient) never acquire a DB connection.
+     * Only the ~1% that pass the Redis gate touch the database.
+     *
+     * NOT @Transactional — the DB transaction is pushed as far down as possible,
+     * opened only inside persistOrder() after Redis confirms stock availability.
      */
     public OrderResponse createOrder(Long userId, CreateOrderRequest request) {
+
+        // ── Phase 0: Redis idempotency gate (no DB connection) ───────────────
 
         OrderResponse cached = checkRedisIdempotency(request.getRequestId());
         if (cached != null) {
             return cached;
         }
 
+        // ── Phase 1 + 2: deduct → persist ────────────────────────────────────
+
+        DeductionResult deductionResult = null;
         try {
-            OrderResponse response = self.doCreateOrder(userId, request);
+            // Phase 1: stock deduction — pure Redis Lua, no DB connection.
+            // Falls back to DB adapter (REQUIRES_NEW) if Redis is unavailable.
+            deductionResult = inventoryPort.deductStock(
+                    request.getTicketTypeId(), request.getQuantity());
+
+            // Phase 2: DB persist — short @Transactional, single connection.
+            // Validates ticket type, syncs deduction to DB, saves order.
+            OrderResponse response = self.persistOrder(userId, request, deductionResult);
             markIdempotencyCompleted(request.getRequestId(), response.getOrderNo());
             return response;
 
         } catch (DataIntegrityViolationException e) {
+            // DB unique constraint on request_id — another thread won the insert race.
+            // Stock was deducted (Redis or DB fallback); must compensate.
+            if (deductionResult != null) {
+                inventoryPort.compensateDeduction(
+                        request.getTicketTypeId(), request.getQuantity(), deductionResult);
+            }
             releaseIdempotencyKey(request.getRequestId());
             log.info("[Order] Idempotency enforced by DB constraint: requestId={}",
                     request.getRequestId());
@@ -80,6 +101,15 @@ public class OrderService {
                     "Duplicate request detected — order already exists");
 
         } catch (BizException e) {
+            // Stock was deducted but order creation failed.
+            // Compensate unless deductStock itself threw (deductionResult would be null).
+            if (deductionResult != null) {
+                inventoryPort.compensateDeduction(
+                        request.getTicketTypeId(), request.getQuantity(), deductionResult);
+            }
+
+            // Optimistic lock conflict in DB fallback — check if another thread
+            // already created the order with the same requestId.
             if (e.getCode() == ResultCode.INVENTORY_LOCK_FAILED.getCode()) {
                 releaseIdempotencyKey(request.getRequestId());
                 return orderRepository.findByRequestId(request.getRequestId())
@@ -94,20 +124,39 @@ public class OrderService {
             throw e;
 
         } catch (Exception e) {
+            if (deductionResult != null) {
+                log.error("[Order] Persist failed, compensating: ticketTypeId={}, qty={}",
+                        request.getTicketTypeId(), request.getQuantity());
+                inventoryPort.compensateDeduction(
+                        request.getTicketTypeId(), request.getQuantity(), deductionResult);
+            }
             releaseIdempotencyKey(request.getRequestId());
             throw e;
         }
     }
 
     /**
-     * Core order creation. Must be public so the Spring proxy intercepts
-     * @Transactional. Called via self.doCreateOrder().
+     * Validates the ticket type, syncs the stock deduction to DB, and saves the order.
+     *
+     * This is the ONLY method that acquires a DB connection during order creation.
+     * It must be public for the Spring proxy to intercept @Transactional.
+     *
+     * noRollbackFor = BizException: if ticket validation or DB guard check fails,
+     * the transaction does not roll back (there's nothing to roll back — no writes
+     * happened yet). The caller's catch block handles compensation.
      */
     @Transactional(noRollbackFor = BizException.class)
-    public OrderResponse doCreateOrder(Long userId, CreateOrderRequest request) {
+    public OrderResponse persistOrder(Long userId, CreateOrderRequest request,
+                                      DeductionResult deductionResult) {
 
+        // DB-level idempotency: another thread may have inserted while we were
+        // in Phase 1. Check before doing any work.
         if (orderRepository.existsByRequestId(request.getRequestId())) {
-            log.info("[Order] Duplicate requestId detected via DB check: {}",
+            // Stock was already deducted in Phase 1 for THIS request.
+            // Compensate, then return the existing order.
+            inventoryPort.compensateDeduction(
+                    request.getTicketTypeId(), request.getQuantity(), deductionResult);
+            log.info("[Order] Duplicate requestId detected via DB, stock compensated: {}",
                     request.getRequestId());
             return orderRepository.findByRequestId(request.getRequestId())
                     .map(OrderResponse::from)
@@ -115,6 +164,7 @@ public class OrderService {
                             "Idempotency key exists but order not found"));
         }
 
+        // Validate ticket type — LAZY fetch of Event works because we're in a Session.
         TicketType ticketType = ticketTypeRepository.findById(request.getTicketTypeId())
                 .orElseThrow(() -> BizException.of(ResultCode.TICKET_TYPE_NOT_FOUND,
                         "Ticket type not found: " + request.getTicketTypeId()));
@@ -124,44 +174,38 @@ public class OrderService {
                     "Event is not currently on sale");
         }
 
-        inventoryPort.deductStock(request.getTicketTypeId(), request.getQuantity());
+        // Sync deduction to DB — no-op if DB fallback was used.
+        // Throws BizException if DB guard check fails (Redis/DB drift).
+        inventoryPort.persistDeduction(
+                request.getTicketTypeId(), request.getQuantity(), deductionResult);
 
-        try {
-            Order order = Order.create(
-                    generateOrderNo(),
-                    userId,
-                    request.getTicketTypeId(),
-                    request.getQuantity(),
-                    ticketType.getPrice(),
-                    request.getRequestId()
-            );
-            orderRepository.save(order);
+        // Save order — all within this single short transaction.
+        Order order = Order.create(
+                generateOrderNo(),
+                userId,
+                request.getTicketTypeId(),
+                request.getQuantity(),
+                ticketType.getPrice(),
+                request.getRequestId()
+        );
+        orderRepository.save(order);
 
-            log.info("[Order] Created: orderNo={}, userId={}, ticketTypeId={}, qty={}",
-                    order.getOrderNo(), userId, request.getTicketTypeId(),
-                    request.getQuantity());
+        log.info("[Order] Created: orderNo={}, userId={}, ticketTypeId={}, qty={}",
+                order.getOrderNo(), userId, request.getTicketTypeId(),
+                request.getQuantity());
 
-            return OrderResponse.from(order);
-
-        } catch (Exception e) {
-            if (e instanceof DataIntegrityViolationException) {
-                throw e;
-            }
-            log.error("[Order] Order save failed, releasing inventory: " +
-                            "ticketTypeId={}, qty={}", request.getTicketTypeId(),
-                    request.getQuantity());
-            inventoryPort.releaseStock(request.getTicketTypeId(), request.getQuantity());
-            throw e;
-        }
+        return OrderResponse.from(order);
     }
+
+    // ─── Lifecycle operations (unchanged) ────────────────────────────────────
 
     /**
      * User-initiated cancellation.
      *
-     * Phase 2: inventory is restored asynchronously via Kafka.
+     * Inventory is restored asynchronously via Kafka.
      * OrderCancelledEvent is published inside the transaction.
-     * @TransactionalEventListener(AFTER_COMMIT) in OrderCancelledKafkaPublisher
-     * forwards it to Kafka only after the DB commit succeeds — no ghost restores.
+     * @TransactionalEventListener(AFTER_COMMIT) forwards it to Kafka
+     * only after the DB commit succeeds — no ghost restores.
      */
     @Transactional
     public OrderResponse cancelOrder(String orderNo, Long userId) {
@@ -243,15 +287,8 @@ public class OrderService {
     /**
      * System-initiated cancellation (timeout).
      *
-     * Accepts orderNo rather than an Order entity. This is intentional:
-     * OrderTimeoutService loads expired Orders in its own (non-transactional)
-     * context, making them detached entities. Passing a detached entity whose
-     * lazy-loaded statusHistory collection is uninitialized would throw
-     * LazyInitializationException when transitionTo() tries to add to that
-     * collection. Loading fresh inside this @Transactional ensures the entity
-     * is attached and all collections can be initialized on demand.
-     *
-     * Inventory release is async via Kafka, same as user cancellation.
+     * Accepts orderNo rather than an Order entity to avoid detached-entity
+     * LazyInitializationException. See full explanation in previous version.
      */
     @Transactional
     public void cancelOrderBySystem(String orderNo) {

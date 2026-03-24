@@ -8,7 +8,6 @@ import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.annotation.Primary;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
@@ -21,10 +20,11 @@ import org.springframework.transaction.annotation.Transactional;
  *   1. Phase 1 — sole InventoryPort implementation
  *   2. Phase 2 — fallback when Redis is unavailable
  *
- * In Phase 2, RedisInventoryAdapter (@Primary) delegates here on RedisException.
+ * In Phase 2, RedisInventoryAdapter (@Primary) delegates here when Redis
+ * throws. The REQUIRES_NEW on deductStock() ensures the fallback deduction
+ * commits independently — it does not nest inside the caller's transaction.
  */
 @Slf4j
-//@Primary
 @Component
 @RequiredArgsConstructor
 public class InventoryAdapter implements InventoryPort {
@@ -33,7 +33,7 @@ public class InventoryAdapter implements InventoryPort {
 
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void deductStock(Long ticketTypeId, int quantity) {
+    public DeductionResult deductStock(Long ticketTypeId, int quantity) {
         Inventory inventory = findInventory(ticketTypeId);
         try {
             inventory.deduct(quantity);
@@ -41,11 +41,30 @@ public class InventoryAdapter implements InventoryPort {
             inventoryRepository.flush();
             log.info("[Inventory] Deducted: ticketTypeId={}, quantity={}, remaining={}",
                     ticketTypeId, quantity, inventory.getAvailableStock());
+            return DeductionResult.DB_FALLBACK;
         } catch (OptimisticLockingFailureException e) {
             log.warn("[Inventory] Optimistic lock conflict: ticketTypeId={}", ticketTypeId);
             throw BizException.of(ResultCode.INVENTORY_LOCK_FAILED,
                     "High demand — please try again");
         }
+    }
+
+    /**
+     * No-op — deductStock() already performed the full DB deduction.
+     * The DB_FALLBACK result signals that no additional persistence is needed.
+     */
+    @Override
+    public void persistDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
+        // Intentionally empty. deductStock committed via REQUIRES_NEW.
+    }
+
+    /**
+     * Undo a deductStock(). Delegates to releaseStock() which handles
+     * the optimistic-lock-safe increment.
+     */
+    @Override
+    public void compensateDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
+        releaseStock(ticketTypeId, quantity);
     }
 
     @Override
@@ -67,8 +86,7 @@ public class InventoryAdapter implements InventoryPort {
 
     /**
      * DB-only release for the Kafka consumer async path.
-     * Lua script already restored Redis atomically; this method only syncs DB.
-     * Identical to releaseStock() in this adapter — Redis is not involved here.
+     * Identical to releaseStock() in this adapter — Redis is not involved.
      */
     @Override
     @Transactional

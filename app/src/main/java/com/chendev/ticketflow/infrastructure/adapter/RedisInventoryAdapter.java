@@ -16,13 +16,18 @@ import org.springframework.transaction.annotation.Transactional;
 /**
  * Redis-backed implementation of InventoryPort.
  *
- * Uses atomic Lua scripts to prevent overselling during high-concurrency
- * "flash sale" scenarios. Implements a write-through strategy to the
- * database for persistence.
+ * Phase 2 architecture — Transactionless Fast Path:
  *
- * Degradation path: If Redis is unavailable, the system automatically
- * falls back to the database-backed InventoryAdapter to maintain availability
- * at the cost of reduced throughput.
+ *   deductStock()       — pure Redis Lua, NO @Transactional, zero DB connections.
+ *   persistDeduction()  — DB guard write, joins caller's @Transactional (REQUIRED).
+ *   compensateDeduction() — undo Redis (FAST_PATH) or DB (DB_FALLBACK).
+ *
+ * This separation means requests rejected by Redis never acquire a DB connection.
+ * Only the ~1% that pass the Redis gate touch the database.
+ *
+ * Degradation: if Redis is unavailable, deductStock() falls back to the
+ * DB adapter (REQUIRES_NEW). The system degrades to Phase 1 throughput
+ * but remains correct — zero overselling guaranteed.
  */
 @Slf4j
 @Primary
@@ -34,10 +39,24 @@ public class RedisInventoryAdapter implements InventoryPort {
     private final InventoryRepository   inventoryRepository;
     private final InventoryAdapter      dbFallbackAdapter;
 
+    // ─── Core deduction flow (Phase 2 fast path) ─────────────────────────────
+
+    /**
+     * Deduct stock from Redis using atomic Lua script.
+     *
+     * NOT @Transactional — no DB connection is acquired on the hot path.
+     *
+     * If Redis is unavailable, delegates to the DB adapter which uses
+     * REQUIRES_NEW. This acquires a short-lived connection for the fallback
+     * deduction only — acceptable for the degraded path.
+     *
+     * Cache miss (Lua returns -1): loads inventory from DB into Redis via a
+     * brief non-transactional read, then retries. This read acquires and
+     * immediately releases a connection — it does not hold it for the
+     * duration of the Lua call.
+     */
     @Override
-    @Transactional(propagation = Propagation.REQUIRES_NEW,
-            noRollbackFor = BizException.class)
-    public void deductStock(Long ticketTypeId, int quantity) {
+    public DeductionResult deductStock(Long ticketTypeId, int quantity) {
         try {
             Long result = redisInventoryManager.deductStock(ticketTypeId, quantity);
 
@@ -47,7 +66,7 @@ public class RedisInventoryAdapter implements InventoryPort {
             }
 
             handleDeductResult(result, ticketTypeId);
-            persistDeductToDB(ticketTypeId, quantity);
+            return DeductionResult.FAST_PATH;
 
         } catch (BizException e) {
             throw e;
@@ -55,8 +74,62 @@ public class RedisInventoryAdapter implements InventoryPort {
             log.warn("[RedisInventory] Redis unavailable, falling back to DB adapter: "
                     + "ticketTypeId={}, reason={}", ticketTypeId, e.getMessage());
             dbFallbackAdapter.deductStock(ticketTypeId, quantity);
+            return DeductionResult.DB_FALLBACK;
         }
     }
+
+    /**
+     * Sync the Redis deduction to DB via guard write.
+     * Joins the caller's @Transactional (REQUIRED propagation — no annotation
+     * needed since REQUIRED is the default when called within a tx context).
+     *
+     * No-op when the DB fallback was used — it already committed in its
+     * own REQUIRES_NEW transaction.
+     *
+     * If the guard check fails (Redis/DB drift), throws BizException.
+     * The caller is responsible for calling compensateDeduction().
+     */
+    @Override
+    public void persistDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
+        if (result == DeductionResult.DB_FALLBACK) {
+            log.debug("[RedisInventory] Skipping persistDeduction — DB fallback " +
+                    "already committed: ticketTypeId={}", ticketTypeId);
+            return;
+        }
+
+        int updated = inventoryRepository.guardDeductStock(ticketTypeId, quantity);
+
+        if (updated == 0) {
+            // Redis deducted but DB says insufficient — drift detected.
+            // Don't compensate here — let the caller's compensateDeduction() handle it.
+            throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT,
+                    "Tickets sold out (DB guard check failed)");
+        }
+
+        log.info("[RedisInventory] DB guard write succeeded: ticketTypeId={}, qty={}",
+                ticketTypeId, quantity);
+    }
+
+    /**
+     * Undo a deductStock() that was not successfully persisted.
+     *
+     * FAST_PATH:   Redis INCRBY only — DB was never modified, or was rolled
+     *              back as part of the caller's failed transaction.
+     * DB_FALLBACK: delegates to DB adapter's releaseStock — the fallback
+     *              committed in its own REQUIRES_NEW and must be explicitly undone.
+     */
+    @Override
+    public void compensateDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
+        if (result == DeductionResult.DB_FALLBACK) {
+            log.info("[RedisInventory] Compensating DB fallback deduction: " +
+                    "ticketTypeId={}, qty={}", ticketTypeId, quantity);
+            dbFallbackAdapter.releaseStock(ticketTypeId, quantity);
+        } else {
+            compensateRedis(ticketTypeId, quantity);
+        }
+    }
+
+    // ─── Release operations (unchanged from Phase 2 baseline) ────────────────
 
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW,
@@ -95,9 +168,6 @@ public class RedisInventoryAdapter implements InventoryPort {
      * inventory atomically in the same command as the idempotency check.
      * Calling releaseStock() here would INCRBY Redis a second time (+2 bug).
      * This method skips Redis entirely and only syncs DB.
-     *
-     * On Redis failure: no fallback needed — Redis was already updated by Lua.
-     * On DB failure: exception propagates to Kafka ErrorHandler for retry/DLQ.
      */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -122,19 +192,6 @@ public class RedisInventoryAdapter implements InventoryPort {
 
     // ─── Private helpers ─────────────────────────────────────────────────────
 
-    private void persistDeductToDB(Long ticketTypeId, int quantity) {
-        int updated = inventoryRepository.guardDeductStock(ticketTypeId, quantity);
-
-        if (updated == 0) {
-            compensateRedis(ticketTypeId, quantity);
-            throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT,
-                    "Tickets sold out (DB guard check failed)");
-        }
-
-        log.info("[RedisInventory] DB guard write succeeded: ticketTypeId={}, qty={}",
-                ticketTypeId, quantity);
-    }
-
     private void persistReleaseToDB(Long ticketTypeId, int quantity) {
         int updated = inventoryRepository.guardReleaseStock(ticketTypeId, quantity);
 
@@ -153,7 +210,7 @@ public class RedisInventoryAdapter implements InventoryPort {
             log.info("[RedisInventory] Redis compensation succeeded: " +
                     "ticketTypeId={}, qty={}", ticketTypeId, quantity);
         } catch (Exception compensationEx) {
-            log.error("[RedisInventory] COMPENSATION FAILED — manual reconciliation required: "
+            log.error("[RedisInventory] COMPENSATION FAILED — reconciler will correct: "
                             + "ticketTypeId={}, qty={}, reason={}",
                     ticketTypeId, quantity, compensationEx.getMessage());
         }

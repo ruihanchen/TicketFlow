@@ -3,11 +3,17 @@ spring:
     enabled: true
   datasource:
     hikari:
-      # Sizing rationale for ConcurrentInventoryTest (the most demanding test):
-      #   200 threads × 2 connections per thread = 400 connections max
-      #   (outer @Transactional in OrderService + REQUIRES_NEW in RedisInventoryAdapter)
-      #   420 = 400 needed + 20 buffer for background threads
-      maximum-pool-size: 200
+      # Sizing rationale (Transactionless Fast Path — ADR-008):
+      #
+      #   Before: 200 threads × 2 conns (outer tx + REQUIRES_NEW) = 420 required
+      #   After:  rejected requests never touch DB; successful requests use 1 conn
+      #
+      #   Redis path:    0 conns (deductStock) + 1 conn (persistOrder) = 1 concurrent
+      #   Fallback path: 1 conn (REQUIRES_NEW, released) + 1 conn (persistOrder) = 1 at a time
+      #
+      #   50 connections comfortably handles 200 concurrent threads because
+      #   most threads are blocked in Redis (sub-ms), not holding DB connections.
+      maximum-pool-size: 50
 
   kafka:
     consumer:
