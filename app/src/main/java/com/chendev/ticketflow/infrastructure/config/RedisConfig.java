@@ -5,24 +5,13 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.script.RedisScript;
 
-/**
- * Redis infrastructure configuration.
- *
- * Lua scripts are loaded once at startup and cached as RedisScript beans.
- * Loading at startup means:
- *   - ClassPathResource resolution errors surface at boot time, not at
- *     runtime when the first order is placed.
- *   - The script SHA is computed once and reused via EVALSHA for all
- *     subsequent calls, reducing Redis round-trip payload size.
- */
 @Configuration
 public class RedisConfig {
 
-    /**
-     * Atomic inventory deduction script.
-     * Returns: 1 (success), 0 (insufficient stock), -1 (cache miss).
-     * See: resources/scripts/deduct_stock.lua
-     */
+    // Scripts are pre-loaded to catch path errors early and leverage EVALSHA caching.
+    // Simple SETNX operations are kept in Java; Lua is reserved for GET-then-SET atomicity.
+
+    // Returns: 1=Success, 0=Insufficient, -1=Miss
     @Bean
     public RedisScript<Long> deductStockScript() {
         return RedisScript.of(
@@ -31,13 +20,7 @@ public class RedisConfig {
         );
     }
 
-    /**
-     * Atomic inventory release script.
-     * Returns: 1 (success), 0 (key absent — Redis restarted).
-     * Used by RedisInventoryAdapter for synchronous release paths
-     * (compensation, direct cancel).
-     * See: resources/scripts/release_stock.lua
-     */
+    // Returns: 1=Success, 0=Key missing
     @Bean
     public RedisScript<Long> releaseStockScript() {
         return RedisScript.of(
@@ -46,12 +29,8 @@ public class RedisConfig {
         );
     }
 
-    /**
-     * Atomic idempotent inventory release script for Kafka consumer.
-     * Combines idempotency check + stock increment in one Redis command.
-     * Returns: "OK" | "DUPLICATE" | "CACHE_MISS".
-     * See: resources/scripts/release_stock_idempotent.lua
-     */
+    // For Kafka: Atomically checks idempotency before incrementing.
+    // Returns: "OK" | "DUPLICATE" | "CACHE_MISS"
     @Bean
     public RedisScript<String> releaseStockIdempotentScript() {
         return RedisScript.of(

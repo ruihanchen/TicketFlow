@@ -6,54 +6,57 @@ import com.chendev.ticketflow.inventory.entity.Inventory;
 import com.chendev.ticketflow.inventory.redis.RedisInventoryManager;
 import com.chendev.ticketflow.inventory.repository.InventoryRepository;
 import com.chendev.ticketflow.order.port.InventoryPort;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
- * Redis-backed implementation of InventoryPort.
+ * Redis-based inventory implementation.
+ * * Performance Strategy:
+ * We use a "Fast Path" approach where we try to deduct stock in Redis first using Lua scripts.
+ * This happens outside of any DB transaction to avoid wasting database connections on
+ * requests that will eventually fail due to lack of stock.
  *
- * Phase 2 architecture — Transactionless Fast Path:
- *
- *   deductStock()       — pure Redis Lua, NO @Transactional, zero DB connections.
- *   persistDeduction()  — DB guard write, joins caller's @Transactional (REQUIRED).
- *   compensateDeduction() — undo Redis (FAST_PATH) or DB (DB_FALLBACK).
- *
- * This separation means requests rejected by Redis never acquire a DB connection.
- * Only the ~1% that pass the Redis gate touch the database.
- *
- * Degradation: if Redis is unavailable, deductStock() falls back to the
- * DB adapter (REQUIRES_NEW). The system degrades to Phase 1 throughput
- * but remains correct — zero overselling guaranteed.
+ * Only when Redis confirms stock is available do we proceed to the database (persistDeduction).
+ * If Redis is down, we fall back to a direct DB deduction to keep the system alive.
  */
 @Slf4j
 @Primary
 @Component
-@RequiredArgsConstructor
 public class RedisInventoryAdapter implements InventoryPort {
 
     private final RedisInventoryManager redisInventoryManager;
     private final InventoryRepository   inventoryRepository;
     private final InventoryAdapter      dbFallbackAdapter;
 
+    /**
+     * Local locks to prevent "thundering herd" issues during cache misses.
+     * We're using a ConcurrentHashMap to keep locks granular (per ticketTypeId).
+     * * Note: This map grows over time but since the number of active ticket types
+     * is relatively small (<10k), it's not a memory concern. For high-SKU
+     * environments, consider using Guava Striped locks instead.
+     */
+    private final ConcurrentHashMap<Long, Object> cacheMissLocks = new ConcurrentHashMap<>();
+
+    public RedisInventoryAdapter(RedisInventoryManager redisInventoryManager,
+                                 InventoryRepository inventoryRepository,
+                                 InventoryAdapter dbFallbackAdapter) {
+        this.redisInventoryManager = redisInventoryManager;
+        this.inventoryRepository = inventoryRepository;
+        this.dbFallbackAdapter = dbFallbackAdapter;
+    }
+
     // ─── Core deduction flow (Phase 2 fast path) ─────────────────────────────
 
     /**
-     * Deduct stock from Redis using atomic Lua script.
-     *
-     * NOT @Transactional — no DB connection is acquired on the hot path.
-     *
-     * If Redis is unavailable, delegates to the DB adapter which uses
-     * REQUIRES_NEW. This acquires a short-lived connection for the fallback
-     * deduction only — acceptable for the degraded path.
-     *
-     * Cache miss (Lua returns -1): loads inventory from DB into Redis via a
-     * brief non-transactional read, then retries. This read acquires and
-     * immediately releases a connection — it does not hold it for the
-     * duration of the Lua call.
+     * Deducts stock via Redis Lua script.
+     * * No @Transactional here because we don't want to hold a DB connection
+     * during the Redis IO. If Redis is down, we use the DB fallback which
+     * handles its own transaction (REQUIRES_NEW).
      */
     @Override
     public DeductionResult deductStock(Long ticketTypeId, int quantity) {
@@ -78,17 +81,6 @@ public class RedisInventoryAdapter implements InventoryPort {
         }
     }
 
-    /**
-     * Sync the Redis deduction to DB via guard write.
-     * Joins the caller's @Transactional (REQUIRED propagation — no annotation
-     * needed since REQUIRED is the default when called within a tx context).
-     *
-     * No-op when the DB fallback was used — it already committed in its
-     * own REQUIRES_NEW transaction.
-     *
-     * If the guard check fails (Redis/DB drift), throws BizException.
-     * The caller is responsible for calling compensateDeduction().
-     */
     @Override
     public void persistDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
         if (result == DeductionResult.DB_FALLBACK) {
@@ -100,8 +92,6 @@ public class RedisInventoryAdapter implements InventoryPort {
         int updated = inventoryRepository.guardDeductStock(ticketTypeId, quantity);
 
         if (updated == 0) {
-            // Redis deducted but DB says insufficient — drift detected.
-            // Don't compensate here — let the caller's compensateDeduction() handle it.
             throw BizException.of(ResultCode.INVENTORY_INSUFFICIENT,
                     "Tickets sold out (DB guard check failed)");
         }
@@ -110,14 +100,6 @@ public class RedisInventoryAdapter implements InventoryPort {
                 ticketTypeId, quantity);
     }
 
-    /**
-     * Undo a deductStock() that was not successfully persisted.
-     *
-     * FAST_PATH:   Redis INCRBY only — DB was never modified, or was rolled
-     *              back as part of the caller's failed transaction.
-     * DB_FALLBACK: delegates to DB adapter's releaseStock — the fallback
-     *              committed in its own REQUIRES_NEW and must be explicitly undone.
-     */
     @Override
     public void compensateDeduction(Long ticketTypeId, int quantity, DeductionResult result) {
         if (result == DeductionResult.DB_FALLBACK) {
@@ -129,7 +111,6 @@ public class RedisInventoryAdapter implements InventoryPort {
         }
     }
 
-    // ─── Release operations (unchanged from Phase 2 baseline) ────────────────
 
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW,
@@ -161,14 +142,6 @@ public class RedisInventoryAdapter implements InventoryPort {
         }
     }
 
-    /**
-     * DB-only release for the Kafka consumer async path.
-     *
-     * The Lua script (release_stock_idempotent.lua) already restored Redis
-     * inventory atomically in the same command as the idempotency check.
-     * Calling releaseStock() here would INCRBY Redis a second time (+2 bug).
-     * This method skips Redis entirely and only syncs DB.
-     */
     @Override
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void releaseStockDbOnly(Long ticketTypeId, int quantity) {
@@ -216,15 +189,46 @@ public class RedisInventoryAdapter implements InventoryPort {
         }
     }
 
+    /**
+     * Handles cache misses using a Double-Checked Locking (DCL) pattern.
+     * * When the cache is cold, multiple concurrent threads will see a miss. To avoid
+     * overwhelming the database with identical queries, we lock by ticketTypeId
+     * so only one thread performs the DB read and populates Redis.
+     */
     private void loadInventoryIntoRedis(Long ticketTypeId) {
-        Inventory inventory = inventoryRepository.findByTicketTypeId(ticketTypeId)
-                .orElseThrow(() -> BizException.of(
-                        ResultCode.TICKET_TYPE_NOT_FOUND,
-                        "Inventory not found for ticketTypeId=" + ticketTypeId));
+        // First check (lock-free): skip if another thread already loaded.
+        if (redisInventoryManager.getStock(ticketTypeId).isPresent()) {
+            log.debug("[RedisInventory] Cache already populated, " +
+                    "skipping DB read: ticketTypeId={}", ticketTypeId);
+            return;
+        }
 
-        redisInventoryManager.setStock(ticketTypeId, inventory.getAvailableStock());
-        log.info("[RedisInventory] Cache miss — loaded from DB: ticketTypeId={}, stock={}",
-                ticketTypeId, inventory.getAvailableStock());
+        // Acquire per-ticketTypeId lock.
+        Object lock = cacheMissLocks.computeIfAbsent(ticketTypeId, k -> new Object());
+
+        synchronized (lock) {
+            // Second check: the thread before us may have loaded it.
+            if (redisInventoryManager.getStock(ticketTypeId).isPresent()) {
+                log.debug("[RedisInventory] Lock acquired but cache already populated, " +
+                        "skipping DB read: ticketTypeId={}", ticketTypeId);
+                return;
+            }
+
+            // Only the first thread reaches here — single DB read.
+            Inventory inventory = inventoryRepository.findByTicketTypeId(ticketTypeId)
+                    .orElseThrow(() -> BizException.of(
+                            ResultCode.TICKET_TYPE_NOT_FOUND,
+                            "Inventory not found for ticketTypeId=" + ticketTypeId));
+
+            boolean loaded = redisInventoryManager.setStockIfAbsent(
+                    ticketTypeId, inventory.getAvailableStock());
+
+            if (loaded) {
+                log.info("[RedisInventory] Cache miss — loaded from DB: " +
+                                "ticketTypeId={}, stock={}",
+                        ticketTypeId, inventory.getAvailableStock());
+            }
+        }
     }
 
     private void handleDeductResult(Long result, Long ticketTypeId) {
