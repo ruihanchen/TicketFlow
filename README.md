@@ -1,164 +1,154 @@
 # TicketFlow
 
-Built to solve the data consistency challenges in flash-sale scenarios, where DB
-contention usually kills performance. Phase 1 established the data model and
-business logic. Phase 2 moved inventory deduction to Redis and order cancellation
-to Kafka to fix three specific bottlenecks measured in Phase 1.
+Flash-sale ticketing backend. The kind where 200 people hit "buy" at the same
+second and you'd better not sell ticket #51 when you only have 50.
 
-**Stack**: Java 21 · Spring Boot 3.3.5 · PostgreSQL · Redis 7 · Kafka (KRaft) · Testcontainers
+Java 21 · Spring Boot 3.3.5 · PostgreSQL · Redis 7 · Kafka (KRaft) · Testcontainers
 
 ---
 
-## What Changed Between Phases
+## Numbers
 
-Phase 1 ran all inventory writes through PostgreSQL optimistic locking. Under
-load it worked correctly — zero overselling — but 84% of requests wasted on
-lock-conflict retries.
+k6, 40 VUs, 60s. Everything running in Docker on one Windows laptop.
 
-k6, 40 VUs, 60s, identical load profile:
+| | Phase 1 (DB only) | Phase 2 (Redis + DB) | Redis DOWN |
+|--|-------------------|---------------------|------------|
+| Success rate | 13% | **99.97%** | 36% |
+| p50 | 12ms | **7ms** | 38ms |
+| p99 | 26ms | 29ms | 224ms |
+| Lock conflicts | 18,401 | **0** | 10,220 |
+| DB pool size | 420 | **50** | 50 |
+| Error rate | 0% | 0% | **0%** |
 
-| | Phase 1 | Phase 2 | Fallback (Redis DOWN) |
-|--|---------|---------|----------------------|
-| Success rate | **15.59%** | **99.97%** | 35.11% |
-| Lock conflicts | 16,976 | **0** | 10,492 |
-| QPS | 331.5 | 340.5 | 266.2 |
-| p99 | 30ms | 36ms | 148ms |
-| Error rate | 0.00% | 0.00% | **0.00%** |
+The last column matters: Redis goes down, the system gets slow, but nothing
+breaks. No 500s, no overselling, no data loss.
 
-QPS is nearly the same across phases. The machine wasn't the bottleneck — the
-retry collisions were. Phase 2 gets rid of this bottleneck by moving the hot path to Redis. The fallback column matters: with
-Redis fully down, the system degrades to Phase 1 behavior, not a crash.
-
-Full numbers: [docs/benchmarks/mvp-load-test-results.md](docs/benchmarks/mvp-load-test-results.md)
+12/12 integration tests pass against real containers (Testcontainers). No H2,
+no mocks for infrastructure.
 
 ---
 
-## The Three Fixes
+## What this project actually is
 
-**Fix 1: Inventory deduction**
+Phase 1 was a straightforward Spring Boot + PostgreSQL app with optimistic
+locking. It worked — zero overselling — but 87% of requests under load just
+bounced off the lock and wasted everyone's time.
 
-Replaced optimistic locking with a Redis Lua script (`deduct_stock.lua`). Redis
-is single-threaded, so the check-and-decrement is atomic by construction — no
-retry loop needed. DB guard write keeps PostgreSQL accurate. Reconciler corrects
-Redis/DB drift.
+Phase 2 was about fixing that. Three things changed:
 
-Integration test: 200 threads, 50 tickets. Phase 1: ~33s, heavy WARN logs.
-Phase 2: under 3s, zero lock-conflict logs, zero overselling.
+**1. Redis Lua for inventory.** Moved the check-and-decrement into a Lua script
+so Redis handles it atomically. No more retry storms. Success rate went from 13%
+to 99.97%.
 
-**Fix 2: Cancellation path**
+**2. Ripped the transaction boundary apart.** This was the big one. I had
+`@Transactional` on the order creation method, which meant every request grabbed
+a DB connection *before* even talking to Redis. Requests that Redis rejected
+(stock gone) still held a connection the whole time — for nothing. And the
+adapter used `REQUIRES_NEW`, so successful requests held *two* connections.
+200 threads × 2 connections = I needed a pool of 420 just to not deadlock.
 
-`cancelOrder()` used to call `inventoryPort.releaseStock()` synchronously,
-coupling Order and Inventory in the same transaction. Changed to publishing an
-`OrderCancelledEvent` via `@TransactionalEventListener(AFTER_COMMIT)`. Consumer
-restores inventory asynchronously.
+After refactoring: Redis deduction runs with no `@Transactional`. Only requests
+that actually pass the Redis gate open a DB transaction. Pool went from 420 to
+50. p50 dropped from 11ms to 7ms just from removing the `REQUIRES_NEW` overhead.
 
-The `AFTER_COMMIT` part is non-negotiable. Publishing inside the transaction
-means a DB rollback sends a ghost restore to Kafka — inventory goes up for an
-order that was never actually cancelled.
+**3. Fixed a cache loading bug I created.** When Redis is cold (first request
+after startup), the Lua script returns "cache miss" and the app loads stock from
+DB into Redis. My first version used a plain `SET`. Under 200 concurrent
+threads, they all hit the miss at once, all read DB, and the last `SET` won —
+overwriting deductions that earlier threads already made. Redis thought there
+was more stock than reality. DB guard write caught it (no overselling), but
+Redis was wrong until the reconciler fixed it.
 
-**Fix 3: Consumer idempotency**
-
-Kafka is at-least-once. During rebalance, two consumer instances can receive the
-same message. A naïve `if not exists → increment` is a race condition — both
-pass the check before either sets the key. Fixed with `release_stock_idempotent.lua`:
-SETNX + INCRBY + SETEX as one atomic Redis command. Only one consumer wins.
-
-One bug hit during implementation: the `OK` branch originally called
-`inventoryPort.releaseStock()`, which itself does a Redis INCRBY. The Lua script
-had already done the INCRBY. Result: inventory incremented twice. Fixed by
-adding `releaseStockDbOnly()` to `InventoryPort` — after Lua runs, the consumer
-only touches DB. Lua owns Redis; Java owns DB.
+I tried adding a pre-check (`GET` before the DB read) plus `SETNX` instead of
+`SET`. The write race was fixed, but the logs showed 236 threads still read DB —
+the pre-check was useless because all 200 threads arrived in the same
+microsecond before the first one finished. Ended up with DCL
+(Double-Checked Locking) with per-ticketTypeId locks. Now exactly 1 thread reads
+DB per cold start, the other 199 wait on the lock and find the cache already
+populated.
 
 ---
 
-## Architecture
+## How the order flow works now
 
 ```
-HTTP ──► OrderService ──── InventoryPort ──────────► Redis (Lua)
-              │             (Port & Adapter)               │
-              │                                            ▼
-              │  publishEvent() [in-transaction]       PostgreSQL
-              ▼
-     OrderCancelledKafkaPublisher
-              │  (@TransactionalEventListener AFTER_COMMIT, @Async)
-              ▼
-           Kafka
-              │
-              ▼
-     OrderCancelledConsumer
-       Lua idempotency · releaseStockDbOnly · DLQ on exhaustion
+createOrder()                          ← not @Transactional
+  ├─ Redis SETNX idempotency check     ← 0 DB connections
+  ├─ Redis Lua deductStock()           ← 0 DB connections
+  │    └─ cache miss? → DCL + SETNX   ← 1 DB read, exactly once
+  └─ self.persistOrder()               ← @Transactional starts here
+       ├─ DB guard write               ← same connection
+       └─ order insert                 ← same connection, commit, done
 ```
 
-`InventoryPort` lives in the Order domain. `OrderService` has zero imports from
-the inventory package. Swapping to a remote HTTP adapter in Phase 3 touches one
-file. See ADR-003.
+Rejected requests (99% when stock runs out) never touch the database. They
+bounce off Redis and go home. This is the whole point of the refactoring — not
+faster QPS, but fewer wasted resources.
+
+On cancel, the order status update publishes an `OrderCancelledEvent` via
+`@TransactionalEventListener(AFTER_COMMIT)`. A Kafka consumer picks it up and
+restores inventory using a Lua script that bundles idempotency check + stock
+increment in one atomic command. Caught a fun bug here: the consumer originally
+called `releaseStock()` which does its own Redis `INCRBY` — but the Lua script
+had already incremented. Inventory went up by 2 per cancellation. Fixed by
+adding `releaseStockDbOnly()` to the port interface.
 
 ---
 
-## Test Coverage
+## What's not solved (and why)
 
-All integration tests run against real containers (Testcontainers). No H2, no
-mocks for infrastructure.
+**JVM crash between DB commit and Kafka send.** If the process dies right after
+committing the order cancellation but before the Kafka message gets out, the
+inventory never comes back. The fix is Transactional Outbox — write the message
+to a DB table in the same transaction, poll it out to Kafka separately. I know
+how to build it, but it's a meaningful amount of code (new table, poller,
+cleanup job) for a failure mode that requires a JVM crash at a specific 2ms
+window. Deferred to Phase 3.
 
-| What's tested | Class | Result |
-|---------------|-------|--------|
-| Zero overselling, Redis active | `ConcurrentInventoryTest` | sold=50, oversold=0 ✅ |
-| Zero overselling, Redis down | `RedisDegradationTest` | sold=50, oversold=0 ✅ |
-| Duplicate request handling | `IdempotencyTest` | 1 order created, 0 unexpected errors ✅ |
-| Async restore — user cancel | `KafkaInventoryRestoreTest` | stock restored ✅ |
-| Async restore — system timeout | `KafkaInventoryRestoreTest` | stock restored ✅ |
-| Kafka redelivery — no double-restore | `KafkaInventoryRestoreTest` | afterDuplicate = afterFirst ✅ |
-| Timeout idempotency | `OrderTimeoutTest` | second run publishes 0 events ✅ |
+**Timeout polling has up to 59s lag.** Orders expire 15 minutes after creation,
+but the polling job runs every 60 seconds. A Redis ZSET delayed queue would
+make it near-instant. Deferred.
 
-12/12 pass.
+**Redis Cluster would break the Kafka consumer.** The idempotency Lua script
+operates on two keys with different prefixes. In a cluster, they'd land on
+different slots → `CROSSSLOT` error. Fix is Hash Tag alignment in the key
+naming. Noted in code comments, not implemented because we're on single-node
+Redis.
 
----
-
-## Known Gaps
-
-**JVM crash window**: if the process dies between DB commit and Kafka send, the
-cancellation message is lost and the inventory never comes back. Reconciler can't
-detect it — both Redis and DB show the same pre-cancellation count. `FATAL_KAFKA_DROP`
-log exists for manual recovery. Fix is the Transactional Outbox (Phase 3).
-
-**Timeout polling lag**: up to 59 seconds between order expiry and cancellation.
-Fix is a Redis ZSET delayed queue (Phase 3).
-
-**No distributed tracing**: incidents require log grep by `orderNo` or
-`messageId`. MDC + Micrometer are Phase 3.
+**Reconciler can temporarily overstate stock during in-flight transactions.**
+If the reconciler runs while requests are between Redis deduction and DB commit,
+it sees Redis < DB and "corrects" Redis upward. The DB guard write still
+prevents overselling, but users might briefly see stock that isn't really
+available. Acceptable for now — the reconciler runs every 5 minutes and the
+window is milliseconds.
 
 ---
 
-## Running It
+## Architecture decisions
+
+8 ADRs document the reasoning behind every non-obvious choice. The ones worth
+reading:
+
+- [ADR-003](docs/decisions/ADR-003-port-adapter-pattern.md) — Why inventory
+  deduction goes through a Port interface (paid off when swapping DB adapter
+  for Redis adapter with zero changes to OrderService)
+- [ADR-007](docs/decisions/ADR-007-phase2-high-concurrency.md) — Redis Lua,
+  Kafka async cancellation, consumer idempotency, the +2 bug
+- [ADR-008](docs/decisions/ADR-008-transactionless-fast-path.md) — Transaction
+  boundary refactoring (420→50 pool), DCL cache loading (236→1 DB reads), and
+  why we didn't use Caffeine or Guava Striped for locks
+
+---
+
+## Run it
 
 ```bash
-# Prerequisites: Java 21, Docker
-
-cd docker && docker-compose up -d
+cd docker && docker-compose up -d postgres redis kafka
 ./mvnw spring-boot:run -pl app
-./mvnw test   # runs all 12 integration tests
+
+# Benchmark
+k6 run docs/benchmarks/scripts/phase2-redis.js
+
+# Tests (12/12)
+./mvnw test
 ```
-
----
-
-## Decisions
-
-- [ADR-001: Multi-Module Maven](docs/decisions/ADR-001-multi-module-structure.md)
-- [ADR-002: Inventory as Separate Domain](docs/decisions/ADR-002-inventory-as-separate-domain.md)
-- [ADR-003: Port & Adapter](docs/decisions/ADR-003-port-adapter-pattern.md)
-- [ADR-004: Optimistic Locking (Phase 1)](docs/decisions/ADR-004-optimistic-locking-mvp.md)
-- [ADR-005: Order State Machine](docs/decisions/ADR-005-event-driven-state-machine.md)
-- [ADR-006: Phase 1 Idempotency](docs/decisions/ADR-006-idempotency-phase1-jpa-limitation.md)
-- [ADR-007: Phase 2 High-Concurrency](docs/decisions/ADR-007-phase2-high-concurrency.md)
-
-## Roadmap
-
-**Phase 1 ✅** — JWT auth, event/ticket CRUD, optimistic locking, state machine,
-timeout polling, Port & Adapter, Flyway.
-
-**Phase 2 ✅** — Redis Lua inventory, Redis SETNX idempotency, Kafka async
-cancellation, consumer idempotency, Redis fallback, bounded executor, graceful
-shutdown.
-
-**Phase 3** — Transactional Outbox, `consumed_messages` table, Redis ZSET timeout
-queue, MDC tracing, microservice extraction.
